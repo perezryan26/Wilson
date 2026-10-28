@@ -32,6 +32,13 @@ linters:
           # Allows three nested if, for, case, or select-case blocks and
           # flags a fourth. revive does not count range loops.
           arguments: [3]
+  exclusions:
+    rules:
+      # A table-driven test grows with its cases, which are data, not
+      # logic. Every other limit still applies to tests.
+      - path: _test\.go
+        linters:
+          - funlen
 
 formatters:
   enable:

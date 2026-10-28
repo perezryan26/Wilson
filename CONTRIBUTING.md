@@ -24,7 +24,7 @@ The code is written for a reader who knows Go and has the Raft paper open beside
 
 1. Name things as the paper does: `currentTerm`, `votedFor`, `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex`, `RequestVote`, `AppendEntries`, `InstallSnapshot`. A reader can search the paper for any of them.
 2. Shape handlers like Figure 2. Each RPC receiver follows the figure's numbered steps in order. Rules that apply to every RPC, such as stepping down on a higher term, live in one helper.
-3. Keep functions small and flat: one job, one level of abstraction, and early returns instead of nesting. The linter enforces cyclomatic complexity 10, 60 lines per function, and nesting depth 3. Exceeding a limit needs a `//nolint` comment with a stated reason.
+3. Keep functions small and flat: one job, one level of abstraction, and early returns instead of nesting. The linter enforces cyclomatic complexity 10, 60 lines per function, and nesting depth 3. Test functions are exempt from the length limit, because a table of cases is data, not logic. Exceeding a limit needs a `//nolint` comment with a stated reason.
 4. Avoid cleverness: no reflection, no `unsafe`, no `init()` side effects, no package-level mutable state, and no naked returns. Use generics only where they plainly remove duplication.
 5. Every goroutine has one owner and a documented way to stop.
 6. Wrap errors with context, for example `fmt.Errorf("wal: read record at offset %d: %w", off, err)`. Export the sentinel errors that callers branch on.

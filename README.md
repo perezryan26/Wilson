@@ -150,7 +150,7 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | `make sim SEEDS=N` | Simulator sweep over N seeds (default 1,000) |
 | `make fuzz FUZZTIME=D` | Every fuzz target for duration D each (default 60s) |
 
-**Linting.** golangci-lint v2.15.0 is pinned in the Makefile and runs through `go run`, so there is nothing to install. The first run builds it, which takes about half a minute. It runs `staticcheck`, `revive` (including doc comments on every exported identifier), `errcheck`, `gocyclo`, `funlen`, `nestif`, and `misspell`. The limits are cyclomatic complexity 10, 60 lines per function, and nesting depth 3. Exceeding one needs a `//nolint` comment with a stated reason.
+**Linting.** golangci-lint v2.15.0 is pinned in the Makefile and runs through `go run`, so there is nothing to install. The first run builds it, which takes about half a minute. It runs `staticcheck`, `revive` (including doc comments on every exported identifier), `errcheck`, `gocyclo`, `funlen`, `nestif`, and `misspell`. The limits are cyclomatic complexity 10, 60 lines per function, and nesting depth 3; test functions are exempt from the length limit. Exceeding one needs a `//nolint` comment with a stated reason.
 
 **Commits.** Subjects take the form `<area>: <imperative summary>`, and every commit carries a `Phase: N` trailer. [CONTRIBUTING.md](CONTRIBUTING.md) has the full conventions.
 
