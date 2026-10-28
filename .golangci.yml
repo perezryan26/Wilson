@@ -1,0 +1,38 @@
+# golangci-lint v2 configuration. The Makefile pins the linter's version
+# and runs it with `go run`, so local runs and CI always agree.
+version: "2"
+
+linters:
+  # standard is errcheck, govet, ineffassign, staticcheck (which now
+  # includes the former gosimple and stylecheck checks), and unused.
+  default: standard
+  enable:
+    - funlen
+    - gocyclo
+    - misspell
+    - nestif
+    - revive
+  settings:
+    funlen:
+      lines: 60
+      statements: -1
+    gocyclo:
+      min-complexity: 10
+    nestif:
+      # nestif scores nested ifs rather than measuring depth: a chain of
+      # d nested ifs scores d(d-1)/2, so 5 passes three deep (3) and flags
+      # four deep (6). max-control-nesting below enforces the depth itself.
+      min-complexity: 5
+    revive:
+      # Keep revive's default rules, which include exported and
+      # package-comments, and add the nesting-depth limit of 3.
+      enable-default-rules: true
+      rules:
+        - name: max-control-nesting
+          # Allows three nested if, for, case, or select-case blocks and
+          # flags a fourth. revive does not count range loops.
+          arguments: [3]
+
+formatters:
+  enable:
+    - gofmt
