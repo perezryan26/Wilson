@@ -2,13 +2,13 @@
 
 A linearizable key-value store built on the Raft consensus algorithm, written in Go from scratch and meant to be read beside the [extended Raft paper](https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf).
 
-> **Status: foundations only.** The module layout, build, lint, CI, and design records are in place. The Raft core and everything built on it are not written yet. Each section below says what exists today.
+> **Status: leader election.** The Raft core elects a leader and replaces one that fails, shown by unit tests and a three-node test harness. Log replication, durable storage, the runtime, and the key-value service are not written yet. Each section below says what exists today.
 
 ## Overview and guarantees
 
 Wilson is a replicated key-value store that keeps serving Get, Put, and Delete while a majority of its servers are up. It implements §5–§8 of the paper by Ongaro and Ousterhout: leader election, log replication, safety, membership changes, log compaction, and client interaction. The code is written to be read and maintained by people, with the paper open beside it.
 
-The table lists the guarantees the system is built to provide and the evidence each one rests on. None holds yet, because no Raft code exists. The first five rows are the paper's Figure 3 properties.
+The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far only Election Safety has evidence: unit tests, and a three-node harness that checks it after every step (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
 
 | Guarantee | Meaning | Verified by |
 | --- | --- | --- |
@@ -31,7 +31,7 @@ cd wilson
 make check
 ```
 
-There is no cluster to run yet: `kvnode` and `kvctl` are placeholders that exit with an error.
+There is no cluster to run yet: `kvnode` and `kvctl` are placeholders that exit with an error. `go test ./raft` runs the leader election tests.
 
 ## Architecture
 
@@ -64,11 +64,11 @@ The Raft algorithm lives in a deterministic core with no goroutines, clock, disk
 
 Only `node/` touches time, disk, and the network. The simulator and the MIT 6.5840 test adapter take its place, each with its own clock, storage, and network.
 
-Every package below exists with its package documentation; none has code yet.
+Every package below exists with its package documentation. Only `raft/` and `internal/storage/` have code so far.
 
-- **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs.
+- **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs. So far it implements leader election: the three roles, the randomized election timer, RequestVote, and heartbeats. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes its contract with the runtime.
 - **`node/`** is the runtime. One goroutine feeds the core ticks, inbound messages, and proposals, then handles each `Ready` in order: persist and fsync, send, apply. A storage error stops the process.
-- **`internal/storage/`** persists hard state, log entries, and snapshots. It holds an in-memory implementation for tests and a file implementation built on a segmented write-ahead log.
+- **`internal/storage/`** persists hard state, log entries, and snapshots. It holds an in-memory implementation for tests and a file implementation built on a segmented write-ahead log. So far only the in-memory implementation exists, and it keeps hard state.
 - **`internal/transport/`** carries Raft messages between nodes as JSON over HTTP/1.1 ([ADR-0002](docs/adr/0002-http-json-transport.md)).
 - **`internal/kv/`** is the replicated state machine: the command encoding, Get, Put, and Delete, and the per-client session table that makes retried writes apply once.
 - **`internal/kvserver/`** is the client-facing HTTP API. It proposes commands, waits for them to apply, and points clients at the leader.
@@ -82,10 +82,30 @@ Every package below exists with its package documentation; none has code yet.
 
 ## Paper-to-code map
 
-Each row will name a concept or rule from the paper, the file and function that implement it, and the test that covers it. There are no rows yet.
+Each row names a concept or rule from the paper, the function that implements it, and the tests that cover it. The rows cover leader election: §5.1, §5.2, and the election rules of Figure 2. Every test named here is in `raft/`.
 
-| Paper | Rule | Code | Test |
+| Paper | Rule | Code | Tests |
 | --- | --- | --- | --- |
+| Figure 2, State | `currentTerm` and `votedFor` reach stable storage before the server responds to an RPC | [`Node.Ready`](raft/node.go) puts a vote and the reply granting it in one `Ready`, which the runtime persists before it sends ([ARCHITECTURE.md](docs/ARCHITECTURE.md#the-ready-contract)) | `TestVoteIsDurableBeforeReply` |
+| Figure 2, State | `currentTerm` starts at 0 and only increases; `votedFor` is null until the server votes in the current term | [`becomeFollower`, `becomeCandidate`](raft/node.go) | `TestRequestVoteRejectsStaleTerm`, `TestHigherTermInRequestStepsDown` |
+| §5.2 | Servers start up as followers, from the state they persisted | [`NewNode`](raft/node.go) | `TestNewNodeRestoresHardState`, `TestClusterReplacesFailedLeader` |
+| Figure 2, RequestVote arguments | `term`, `candidateId`, `lastLogIndex`, `lastLogTerm` | [`RequestVoteRequest`](raft/types.go), sent by [`campaign`](raft/election.go) | `TestFollowerTimeoutStartsElection` |
+| Figure 2, RequestVote receiver, step 1 | Reply false if `term < currentTerm` (§5.1) | [`handleRequestVote`](raft/election.go) | `TestRequestVoteRejectsStaleTerm` |
+| Figure 2, RequestVote receiver, step 2 | Grant the vote only if `votedFor` is null or `candidateId`: one vote per term, first come, first served (§5.2) | [`handleRequestVote`](raft/election.go) | `TestOneVotePerTerm`, `TestNewNodeRestoresHardState` |
+| Figure 2, RequestVote receiver, step 2; §5.4.1 | ... and only if the candidate's log is at least as up-to-date as the receiver's | [`isUpToDate`](raft/election.go) | `TestVoteRequiresUpToDateLog` |
+| Figure 2, AppendEntries arguments | `term` and `leaderId`; the log fields arrive with log replication (§5.3) | [`AppendEntriesRequest`](raft/types.go) | `TestLeaderSendsHeartbeats` |
+| Figure 2, AppendEntries receiver, step 1 | Reply false if `term < currentTerm` (§5.1) | [`handleAppendEntries`](raft/append_entries.go) | `TestAppendEntriesRejectsStaleTerm` |
+| Figure 2, Rules for Servers, all servers | A request or response with term T > `currentTerm`: set `currentTerm` = T and convert to follower (§5.1) | [`Node.Step`](raft/node.go), before any handler | `TestHigherTermInRequestStepsDown`, `TestHigherTermInResponseStepsDown` |
+| Figure 2, followers | Respond to RPCs from candidates and leaders | [`handleRequestVote`](raft/election.go), [`handleAppendEntries`](raft/append_entries.go) | `TestOneVotePerTerm`, `TestHeartbeatsSuppressElection` |
+| Figure 2, followers | If the election timeout elapses without an AppendEntries from the current leader or a vote granted, convert to candidate | [`Node.Tick`](raft/node.go); the timer restarts only in [`handleAppendEntries`](raft/append_entries.go) and on a grant in [`handleRequestVote`](raft/election.go) | `TestFollowerTimeoutStartsElection`, `TestHeartbeatsSuppressElection`, `TestElectionTimerReset` |
+| Figure 2, candidates | On conversion, start an election: increment `currentTerm`, vote for self, reset the election timer, send RequestVote to all other servers | [`becomeCandidate`](raft/node.go), [`campaign`](raft/election.go) | `TestFollowerTimeoutStartsElection` |
+| Figure 2, candidates | Votes from a majority of servers: become leader | [`handleRequestVoteResponse`, `hasMajority`](raft/election.go) | `TestCandidateWinsWithMajority`, `TestDuplicateVoteResponseCountsOnce`, `TestSingleServerElectsItself` |
+| Figure 2, candidates; §5.2 | AppendEntries from the new leader: convert to follower | [`handleAppendEntries`](raft/append_entries.go) | `TestCandidateStepsDownOnAppendEntriesFromLeader`, `TestAppendEntriesRejectsStaleTerm` |
+| Figure 2, candidates | If the election timeout elapses, start a new election | [`Node.Tick`](raft/node.go), [`campaign`](raft/election.go) | `TestSplitVoteStartsNewElection` |
+| Figure 2, leaders | Upon election, send an empty AppendEntries (heartbeat) to each server; repeat during idle periods to prevent election timeouts | [`becomeLeader`](raft/node.go), [`broadcastHeartbeat`](raft/append_entries.go) | `TestLeaderSendsHeartbeats`, `TestHeartbeatsSuppressElection` |
+| §5.2 | Election timeouts are chosen at random from a fixed interval, [T, 2T), again for every election | [`resetElectionTimer`](raft/election.go) | `TestElectionTimeoutInRange` |
+| §5.2; Figure 3, Election Safety | At most one leader per term, because each server votes once per term and a winner needs a majority | [`hasMajority`](raft/election.go); a leader that meets a rival of its term panics in [`handleAppendEntries`](raft/append_entries.go) | `TestClusterElectsOneLeader`, `TestTwoLeadersInOneTermPanics` |
+| §5.2 | When the leader fails, the remaining majority elects a new one in a later term | The rules above, together | `TestClusterReplacesFailedLeader` |
 
 ## Verification
 
@@ -93,12 +113,14 @@ Six independent harnesses produce the evidence for correctness, and no single on
 
 | Harness | What it catches | How to run | State |
 | --- | --- | --- | --- |
-| Race detector | Data races in the runtime, transport, kvserver, and client | `make test` | Wired; no tests yet |
+| Race detector | Data races in the runtime, transport, kvserver, and client | `make test` | Runs every test; the code so far is single-threaded |
 | Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Not built |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | Private adapter | Not built |
 | Porcupine | Client histories that are not linearizable | Inside the simulator and chaos tests | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | `make fuzz FUZZTIME=60s` | Wired; no targets yet |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Not built | Not built |
+
+Until the simulator exists, the evidence for leader election comes from unit tests that drive one core with `Tick` and `Step`, and from a synchronous three-node harness that runs whole elections, crashes and restarts the leader, and checks Election Safety after every step, over 1,000 seeds per test. [docs/TESTING.md](docs/TESTING.md#unit-tests-and-the-election-harness) describes both.
 
 Once the simulator exists, every failing seed prints its trace, and `go test ./internal/sim -run TestRandomized -seed=N` replays it exactly.
 
@@ -133,7 +155,7 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | `internal/linearizability/` | Porcupine models and history recording |
 | `cmd/kvnode/`, `cmd/kvctl/` | Server and CLI binaries |
 | `test/chaos/` | Multi-process chaos test |
-| `docs/` | [TESTING.md](docs/TESTING.md) and the decision records in [adr/](docs/adr/) |
+| `docs/` | [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TESTING.md](docs/TESTING.md), and the decision records in [adr/](docs/adr/) |
 | `scripts/` | Helper scripts for the Makefile |
 
 ## Development
@@ -161,3 +183,4 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | Tag | Date | What landed |
 | --- | --- | --- |
 | `phase-0` | 2026-10-27 | Module and package layout, Makefile, lint configuration, CI, contributing and testing guides, ADR-0001 (deterministic core) and ADR-0002 (HTTP/JSON transport) |
+| `phase-1` | 2026-10-27 | Core types and leader election: the three roles, the randomized election timer, RequestVote, heartbeats, in-memory storage, a three-node election harness, and `docs/ARCHITECTURE.md` |
