@@ -1,0 +1,8 @@
+# Course checkout for the MIT 6.5840 test adapter; course code is never committed.
+/.mitlab/
+
+# Test binaries and coverage profiles.
+*.test
+*.out
+
+.DS_Store
