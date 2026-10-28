@@ -27,9 +27,10 @@ func (n *Node) Tick()                       // advance one logical clock tick
 func (n *Node) Step(m Message)              // handle an inbound RPC or response
 func (n *Node) Propose(cmd []byte) (Index, Term, error)
 func (n *Node) Ready() Ready                // effects produced since the last call
+func (n *Node) Status() Status              // read-only role, term, and leader
 ```
 
-Log compaction, read-index reads, and membership changes add `Compact`, `ReadIndex`, and `ProposeConfChange` to this method set without changing the rules below.
+Log compaction, read-index reads, and membership changes add `Compact`, `ReadIndex`, and `ProposeConfChange` to this method set without changing the rules below. `Status`, added with leader election, changes no state; it serves tests, traces, and log lines.
 
 - **One goroutine.** The runtime calls the core from a single goroutine; the core is not safe for concurrent use.
 - **Logical time.** Time is counted in ticks. Each election draws its timeout from [T, 2T) ticks (§5.2) using an injected, seeded `*rand.Rand`.

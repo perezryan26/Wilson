@@ -8,12 +8,25 @@ Six independent harnesses produce the evidence for Wilson's correctness, and no 
 
 | Harness | What it catches | When it runs | State |
 | --- | --- | --- | --- |
-| Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Wired; no tests yet |
+| Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Runs every test; the code so far is single-threaded |
 | Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag | Not built |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | 20 consecutive passing runs | Not built |
 | Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target before each phase tag | Wired; no targets yet |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Nightly | Not built |
+
+## Unit tests and the election harness
+
+Until the simulator exists, these are the evidence for leader election. Both live in `raft/` and run with every `make test`.
+
+- **Unit tests** drive one core with `Tick` and `Step` and check the `Ready` and `Status` it returns, with no sleeps. Each is named after the rule it covers, and the README's [paper-to-code map](../README.md#paper-to-code-map) lists which test covers which rule of Figure 2.
+- **The three-node harness** ([`raft/cluster_test.go`](../raft/cluster_test.go)) runs whole elections in one goroutine. Each round ticks every running server once, then delivers messages in the order they were sent until none are left. Every server's `Ready` is handled as a runtime handles it: hard state saved to in-memory storage, then messages sent. A crashed server loses all but its storage and the messages sent to it while it is down; a restarted one boots from that storage. After every `Ready` the harness checks Election Safety: no two servers ever lead the same term.
+
+`TestClusterElectsOneLeader` and `TestClusterReplacesFailedLeader` each run 1,000 seeds. A seed fixes every server's random source, so a failure names its seed and repeats on every run. Run them alone with:
+
+```sh
+go test ./raft -run TestCluster
+```
 
 ## Race detector
 
