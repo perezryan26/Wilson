@@ -59,6 +59,7 @@ func (c Config) validate() error {
 // stopped. It is the zero value for a server that has never run.
 type RestoredState struct {
 	HardState HardState
+	Entries   []Entry // the log, in index order
 }
 
 // Role is a server's state in §5.1: follower, candidate, or leader.
@@ -105,9 +106,10 @@ type Node struct {
 	electionTick int
 	rand         *rand.Rand
 
-	// Persistent state on all servers (Figure 2), less the log.
+	// Persistent state on all servers (Figure 2).
 	currentTerm Term
 	votedFor    NodeID
+	log         []Entry
 
 	role   Role
 	leader NodeID          // see Status.Leader
@@ -116,6 +118,7 @@ type Node struct {
 	electionElapsed int // ticks since the election timer was last reset
 	electionTimeout int // drawn from [electionTick, 2*electionTick)
 
+	msgs          []Message // messages for the next Ready
 	prevHardState HardState // the hard state as of the last Ready
 }
 
@@ -134,6 +137,7 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		rand:          cfg.Rand,
 		currentTerm:   hs.CurrentTerm,
 		votedFor:      hs.VotedFor,
+		log:           slices.Clone(restored.Entries),
 		prevHardState: hs,
 	}
 	n.becomeFollower(hs.CurrentTerm, None)
@@ -153,11 +157,27 @@ func (n *Node) Tick() {
 	}
 }
 
+// Step handles one inbound message: an RPC request or a response to one.
+func (n *Node) Step(m Message) {
+	// Figure 2, all servers: a request or response from a later term moves
+	// this server to that term as a follower (§5.1).
+	if term := m.term(); term > n.currentTerm {
+		n.becomeFollower(term, None)
+	}
+	switch {
+	case m.RequestVote != nil:
+		n.handleRequestVote(m.RequestVote)
+	case m.RequestVoteResponse != nil:
+		n.handleRequestVoteResponse(m.From, m.RequestVoteResponse)
+	}
+}
+
 // Ready returns the effects produced since the previous call and clears
 // them. The runtime handles each Ready completely, persisting before it
 // sends, before it calls the node again.
 func (n *Node) Ready() Ready {
-	var rd Ready
+	rd := Ready{Messages: n.msgs}
+	n.msgs = nil
 	if hs := (HardState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor}); hs != n.prevHardState {
 		rd.HardState = &hs
 		n.prevHardState = hs
@@ -168,6 +188,12 @@ func (n *Node) Ready() Ready {
 // Status returns the node's role, term, and leader.
 func (n *Node) Status() Status {
 	return Status{Role: n.role, Term: n.currentTerm, Leader: n.leader}
+}
+
+// send queues m for the next Ready.
+func (n *Node) send(m Message) {
+	m.From = n.id
+	n.msgs = append(n.msgs, m)
 }
 
 // becomeFollower makes the node a follower in term, following leader, which

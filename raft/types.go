@@ -15,6 +15,14 @@ type NodeID uint64
 // None is the NodeID that names no server, as in a votedFor that is null.
 const None NodeID = 0
 
+// Entry is one log entry: a command for the state machine and the term in
+// which the leader received it (Figure 2).
+type Entry struct {
+	Index Index
+	Term  Term
+	Data  []byte
+}
+
 // HardState is the state Figure 2 requires a server to keep on stable
 // storage, apart from the log, before it responds to any RPC.
 type HardState struct {
@@ -33,6 +41,22 @@ type Message struct {
 	RequestVoteResponse   *RequestVoteResponse
 	AppendEntries         *AppendEntriesRequest
 	AppendEntriesResponse *AppendEntriesResponse
+}
+
+// term returns the term m carries: the sender's currentTerm, which every
+// request and response includes.
+func (m Message) term() Term {
+	switch {
+	case m.RequestVote != nil:
+		return m.RequestVote.Term
+	case m.RequestVoteResponse != nil:
+		return m.RequestVoteResponse.Term
+	case m.AppendEntries != nil:
+		return m.AppendEntries.Term
+	case m.AppendEntriesResponse != nil:
+		return m.AppendEntriesResponse.Term
+	}
+	return 0
 }
 
 // RequestVoteRequest holds the arguments of the RequestVote RPC, which
