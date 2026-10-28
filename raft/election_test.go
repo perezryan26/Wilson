@@ -215,25 +215,34 @@ func TestVoteIsDurableBeforeReply(t *testing.T) {
 }
 
 // Figure 2, all servers: a request from a later term makes any server a
-// follower in that term, with no vote cast in it yet.
+// follower in that term, with no vote cast in it yet. A RequestVote then
+// gets the vote, and an AppendEntries names the term's leader.
 func TestHigherTermInRequestStepsDown(t *testing.T) {
+	follower := func(*testing.T) *Node { return newTestNode(1, 3, 1) }
+	candidate := func(t *testing.T) *Node { return newCandidate(t, 3) }
+	leader := func(t *testing.T) *Node { return newLeader(t, 3) }
 	tests := []struct {
-		name string
-		node func(*testing.T) *Node
+		name   string
+		node   func(*testing.T) *Node
+		msg    Message
+		status Status
+		hs     HardState
 	}{
-		{"follower", func(*testing.T) *Node { return newTestNode(1, 3, 1) }},
-		{"candidate", func(t *testing.T) *Node { return newCandidate(t, 3) }},
-		{"leader", func(t *testing.T) *Node { return newLeader(t, 3) }},
+		{"follower, RequestVote", follower, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
+		{"candidate, RequestVote", candidate, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
+		{"leader, RequestVote", leader, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
+		{"follower, AppendEntries", follower, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
+		{"candidate, AppendEntries", candidate, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
+		{"leader, AppendEntries", leader, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			n := tt.node(t)
-			n.Step(voteRequest(3, 5, 0, 0))
-			if st := n.Status(); st != (Status{Role: Follower, Term: 5}) {
-				t.Errorf("status = %+v, want a follower in term 5", st)
+			n.Step(tt.msg)
+			if st := n.Status(); st != tt.status {
+				t.Errorf("status = %+v, want %+v", st, tt.status)
 			}
-			// The new term cleared votedFor, so server 3 gets the vote.
-			wantHardState(t, n.Ready(), HardState{CurrentTerm: 5, VotedFor: 3})
+			wantHardState(t, n.Ready(), tt.hs)
 		})
 	}
 }
@@ -263,9 +272,11 @@ func TestHigherTermInResponseStepsDown(t *testing.T) {
 	}
 }
 
-// Figure 2, followers: granting a vote restarts the election timer, but a
-// refused request does not, whatever the reason for refusing. The voter is
-// in term 2, has voted for server 3, and its log ends at index 2 in term 2.
+// Figure 2, followers: an AppendEntries from the current leader or a
+// granted vote restarts the election timer. Nothing else does: not a
+// refused vote, whatever the reason, and not a stale leader's heartbeat.
+// The follower is in term 2, has voted for server 3, and its log ends at
+// index 2 in term 2.
 func TestElectionTimerReset(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -273,9 +284,12 @@ func TestElectionTimerReset(t *testing.T) {
 		reset bool
 	}{
 		{"granted vote", voteRequest(2, 3, 2, 2), true},
-		{"refused: stale term", voteRequest(2, 1, 2, 2), false},
-		{"refused: already voted", voteRequest(2, 2, 2, 2), false},
-		{"refused: stale log in a later term", voteRequest(2, 3, 1, 1), false},
+		{"refused vote: stale term", voteRequest(2, 1, 2, 2), false},
+		{"refused vote: already voted", voteRequest(2, 2, 2, 2), false},
+		{"refused vote: stale log in a later term", voteRequest(2, 3, 1, 1), false},
+		{"heartbeat from the current leader", heartbeat(3, 2), true},
+		{"heartbeat from a later term's leader", heartbeat(2, 3), true},
+		{"heartbeat from a stale leader", heartbeat(2, 1), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

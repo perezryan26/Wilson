@@ -95,6 +95,29 @@ func voteReply(t *testing.T, rd Ready, candidate NodeID) RequestVoteResponse {
 	return *m.RequestVoteResponse
 }
 
+// heartbeat returns an AppendEntries with no entries to server 1 from leader
+// in term.
+func heartbeat(leader NodeID, term Term) Message {
+	return Message{From: leader, To: 1, AppendEntries: &AppendEntriesRequest{
+		Term:     term,
+		LeaderID: leader,
+	}}
+}
+
+// appendReply returns the one message in rd, which must answer an
+// AppendEntries from leader.
+func appendReply(t *testing.T, rd Ready, leader NodeID) AppendEntriesResponse {
+	t.Helper()
+	if len(rd.Messages) != 1 {
+		t.Fatalf("Ready has %d messages, want one AppendEntries reply", len(rd.Messages))
+	}
+	m := rd.Messages[0]
+	if m.From != 1 || m.To != leader || m.AppendEntriesResponse == nil {
+		t.Fatalf("Ready message from %d to %d is not an AppendEntries reply from 1 to %d", m.From, m.To, leader)
+	}
+	return *m.AppendEntriesResponse
+}
+
 func wantHardState(t *testing.T, rd Ready, want HardState) {
 	t.Helper()
 	if rd.HardState == nil || *rd.HardState != want {

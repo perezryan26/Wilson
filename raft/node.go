@@ -101,10 +101,11 @@ type Status struct {
 // carries out the effects that Ready returns. It is not safe for
 // concurrent use.
 type Node struct {
-	id           NodeID
-	peers        []NodeID // every server, this one included, sorted
-	electionTick int
-	rand         *rand.Rand
+	id            NodeID
+	peers         []NodeID // every server, this one included, sorted
+	electionTick  int
+	heartbeatTick int
+	rand          *rand.Rand
 
 	// Persistent state on all servers (Figure 2).
 	currentTerm Term
@@ -115,8 +116,9 @@ type Node struct {
 	leader NodeID          // see Status.Leader
 	votes  map[NodeID]bool // a candidate's granted votes this term, itself included
 
-	electionElapsed int // ticks since the election timer was last reset
-	electionTimeout int // drawn from [electionTick, 2*electionTick)
+	electionElapsed  int // ticks since the election timer was last reset
+	electionTimeout  int // drawn from [electionTick, 2*electionTick)
+	heartbeatElapsed int // a leader's ticks since its last heartbeat
 
 	msgs          []Message // messages for the next Ready
 	prevHardState HardState // the hard state as of the last Ready
@@ -134,6 +136,7 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		id:            cfg.ID,
 		peers:         slices.Sorted(slices.Values(cfg.Peers)),
 		electionTick:  cfg.ElectionTick,
+		heartbeatTick: cfg.HeartbeatTick,
 		rand:          cfg.Rand,
 		currentTerm:   hs.CurrentTerm,
 		votedFor:      hs.VotedFor,
@@ -146,9 +149,14 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 }
 
 // Tick advances the node's logical clock by one tick. A follower or
-// candidate whose election timeout elapses starts an election (Figure 2).
+// candidate whose election timeout elapses starts an election, and a leader
+// sends a heartbeat every heartbeatTick ticks (Figure 2).
 func (n *Node) Tick() {
 	if n.role == Leader {
+		n.heartbeatElapsed++
+		if n.heartbeatElapsed >= n.heartbeatTick {
+			n.broadcastHeartbeat()
+		}
 		return
 	}
 	n.electionElapsed++
@@ -169,7 +177,10 @@ func (n *Node) Step(m Message) {
 		n.handleRequestVote(m.RequestVote)
 	case m.RequestVoteResponse != nil:
 		n.handleRequestVoteResponse(m.From, m.RequestVoteResponse)
+	case m.AppendEntries != nil:
+		n.handleAppendEntries(m.AppendEntries)
 	}
+	// A heartbeat's response matters only for its term, handled above.
 }
 
 // Ready returns the effects produced since the previous call and clears
@@ -220,8 +231,10 @@ func (n *Node) becomeCandidate() {
 	n.resetElectionTimer()
 }
 
-// becomeLeader makes the node the leader of its current term.
+// becomeLeader makes the node the leader of its current term and sends the
+// initial heartbeat that establishes its authority (Figure 2, leaders).
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.leader = n.id
+	n.broadcastHeartbeat()
 }
