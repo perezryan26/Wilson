@@ -1,0 +1,30 @@
+name: nightly
+
+# The runs too long to wait for on every push: a large simulator sweep and
+# longer fuzzing. GitHub schedules it on the default branch; it can also be
+# started by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            Makefile
+      - run: make sim SEEDS=50000
+      # fuzz.sh finds every fuzz target, so new ones join this run unasked.
+      - run: make fuzz FUZZTIME=10m
