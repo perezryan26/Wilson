@@ -344,3 +344,36 @@ func TestElectionTimerReset(t *testing.T) {
 		})
 	}
 }
+
+// §5.4.1: a candidate whose log lacks a committed entry cannot win. S1
+// commits an entry with S2 while S3 hears nothing, then crashes. S3 asks
+// S2 for its vote in term 2, where S2 has not voted, and is refused only
+// because S2's log is more up-to-date. S2 then wins with S3's vote,
+// keeping the committed entry.
+func TestStaleLogCandidateLoses(t *testing.T) {
+	s1, s2, s3 := newTestNode(1, 3, 1), newTestNode(2, 3, 1), newTestNode(3, 3, 1)
+	tickUntilElection(t, s1)
+	exchange(t, s1, s2)
+	if _, _, err := s1.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	exchange(t, s1, s2)
+	if got := s1.Status().CommitIndex; got != 1 {
+		t.Fatalf("S1 commitIndex = %d, want 1 once S2 stored the entry", got)
+	}
+
+	// S3's requests for term 1 are lost; it campaigns again in term 2.
+	tickUntilElection(t, s3)
+	s3.Ready()
+	tickUntilElection(t, s3)
+	exchange(t, s2, s3)
+	if st := s3.Status(); st.Role == Leader || st.Term != 2 {
+		t.Fatalf("S3 status = %+v, want a losing candidate in term 2", st)
+	}
+	tickUntilElection(t, s2)
+	exchange(t, s2, s3)
+	if st := s2.Status(); st.Role != Leader {
+		t.Fatalf("S2 status = %+v, want leader", st)
+	}
+	wantEntries(t, "S2's log", s2.log.from(1), []Entry{{Index: 1, Term: 1, Data: []byte("x")}})
+}
