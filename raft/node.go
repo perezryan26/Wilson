@@ -111,7 +111,7 @@ type Node struct {
 	// Persistent state on all servers (Figure 2).
 	currentTerm Term
 	votedFor    NodeID
-	log         []Entry
+	log         raftLog
 
 	role   Role
 	leader NodeID          // see Status.Leader
@@ -141,7 +141,7 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		rand:          cfg.Rand,
 		currentTerm:   hs.CurrentTerm,
 		votedFor:      hs.VotedFor,
-		log:           slices.Clone(restored.Entries),
+		log:           newLog(restored.Entries),
 		prevHardState: hs,
 	}
 	n.becomeFollower(hs.CurrentTerm, None)

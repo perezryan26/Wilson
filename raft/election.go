@@ -26,7 +26,7 @@ func (n *Node) campaign() {
 // then costs one heartbeat interval instead of a new election and term.
 func (n *Node) requestVotes() {
 	n.heartbeatElapsed = 0
-	lastIndex, lastTerm := n.lastLog()
+	lastIndex, lastTerm := n.log.lastIndex(), n.log.lastTerm()
 	for _, id := range n.peers {
 		if _, answered := n.votes[id]; answered {
 			continue
@@ -101,23 +101,12 @@ func (n *Node) hasMajority() bool {
 	return granted > len(n.peers)/2
 }
 
-// lastLog returns the index and term of the last log entry, or 0 and 0 when
-// the log is empty.
-func (n *Node) lastLog() (Index, Term) {
-	if len(n.log) == 0 {
-		return 0, 0
-	}
-	last := n.log[len(n.log)-1]
-	return last.Index, last.Term
-}
-
 // isUpToDate reports whether a log that ends at lastIndex and lastTerm is
 // at least as up-to-date as this server's (§5.4.1): the later last term
 // wins, and between equal last terms the longer log wins.
 func (n *Node) isUpToDate(lastIndex Index, lastTerm Term) bool {
-	ownIndex, ownTerm := n.lastLog()
-	if lastTerm != ownTerm {
+	if ownTerm := n.log.lastTerm(); lastTerm != ownTerm {
 		return lastTerm > ownTerm
 	}
-	return lastIndex >= ownIndex
+	return lastIndex >= n.log.lastIndex()
 }
