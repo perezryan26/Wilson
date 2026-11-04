@@ -31,7 +31,7 @@ type Cluster struct {
 	seq   uint64 // events scheduled so far
 
 	nodes []*node // nodes[i] is server i+1
-	net   network
+	net   Network
 
 	leaders map[raft.Term]raft.NodeID // every leader seen, by term
 	err     error                     // the first violation, which ends the run
@@ -55,7 +55,7 @@ type node struct {
 func New(opts Options) *Cluster {
 	c := &Cluster{
 		rng:     rand.New(rand.NewPCG(opts.Seed, 0)),
-		net:     network{minDelay: time.Millisecond, maxDelay: 10 * time.Millisecond},
+		net:     DefaultNetwork(),
 		leaders: map[raft.Term]raft.NodeID{},
 	}
 	_, tick := raft.DefaultConfig()
