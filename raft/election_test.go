@@ -65,6 +65,7 @@ func TestSplitVoteStartsNewElection(t *testing.T) {
 	n := newCandidate(t, 3)
 	// Server 2 voted for server 3, and server 3 for itself.
 	n.Step(voteResponse(2, 1, false))
+	n.Step(voteResponse(3, 1, false))
 	if st := n.Status(); st != (Status{Role: Candidate, Term: 1}) {
 		t.Fatalf("status = %+v, want a candidate in term 1", st)
 	}
@@ -75,6 +76,38 @@ func TestSplitVoteStartsNewElection(t *testing.T) {
 	rd := n.Ready()
 	wantHardState(t, rd, HardState{CurrentTerm: 2, VotedFor: 1})
 	wantVoteRequests(t, rd, 3, RequestVoteRequest{Term: 2, CandidateID: 1})
+}
+
+// §5.1: servers retry RPCs that get no timely response. Every heartbeat
+// interval, a candidate sends its RequestVote again to each server that
+// has not answered, and never to one that has.
+func TestCandidateResendsUnansweredRequestVote(t *testing.T) {
+	n := newCandidate(t, 5)
+	n.Step(voteResponse(2, 1, true))
+	n.Step(voteResponse(3, 1, false))
+	want := RequestVoteRequest{Term: 1, CandidateID: 1}
+	for round := range 2 {
+		for range n.heartbeatTick - 1 {
+			n.Tick()
+		}
+		if rd := n.Ready(); len(rd.Messages) != 0 {
+			t.Fatalf("round %d: %d messages before the heartbeat interval elapsed", round, len(rd.Messages))
+		}
+		n.Tick()
+		rd := n.Ready()
+		if len(rd.Messages) != 2 {
+			t.Fatalf("round %d: Ready has %d messages, want RequestVotes to 4 and 5", round, len(rd.Messages))
+		}
+		for i, m := range rd.Messages {
+			if to := NodeID(i + 4); m.To != to || m.RequestVote == nil || *m.RequestVote != want {
+				t.Errorf("round %d: message to %d is not RequestVote %+v to %d", round, m.To, want, to)
+			}
+		}
+	}
+	n.Step(voteResponse(4, 1, true))
+	if st := n.Status(); st != (Status{Role: Leader, Term: 1, Leader: 1}) {
+		t.Errorf("status = %+v after a resent request won the third vote, want the leader of term 1", st)
+	}
 }
 
 // A one-server cluster is its own majority, so its first election makes it
@@ -116,11 +149,13 @@ func TestCandidateWinsWithMajority(t *testing.T) {
 }
 
 // A duplicated vote must not count twice, or a minority could elect a
-// leader.
+// leader, and a vote once granted is never taken back by a later answer
+// from the same server.
 func TestDuplicateVoteResponseCountsOnce(t *testing.T) {
 	n := newCandidate(t, 5)
 	n.Step(voteResponse(2, 1, true))
 	n.Step(voteResponse(2, 1, true))
+	n.Step(voteResponse(2, 1, false))
 	if got := n.Status().Role; got != Candidate {
 		t.Fatalf("role = %v after one vote delivered twice, want candidate", got)
 	}

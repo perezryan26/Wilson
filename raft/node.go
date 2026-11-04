@@ -17,7 +17,8 @@ type Config struct {
 	// ElectionTick is T, the shortest election timeout in ticks. Each
 	// election draws its timeout from [T, 2T) (§5.2).
 	ElectionTick int
-	// HeartbeatTick is the number of ticks between a leader's heartbeats.
+	// HeartbeatTick is the number of ticks between a leader's heartbeats,
+	// and between a candidate's requests to servers that have not answered.
 	// It must be below ElectionTick, so followers hear from a healthy
 	// leader before they time out (§5.6).
 	HeartbeatTick int
@@ -114,11 +115,11 @@ type Node struct {
 
 	role   Role
 	leader NodeID          // see Status.Leader
-	votes  map[NodeID]bool // a candidate's granted votes this term, itself included
+	votes  map[NodeID]bool // a candidate's answers this term by voter, true if granted; its own included
 
 	electionElapsed  int // ticks since the election timer was last reset
 	electionTimeout  int // drawn from [electionTick, 2*electionTick)
-	heartbeatElapsed int // a leader's ticks since its last heartbeat
+	heartbeatElapsed int // ticks since a leader's last heartbeat or a candidate's last requests
 
 	msgs          []Message // messages for the next Ready
 	prevHardState HardState // the hard state as of the last Ready
@@ -149,8 +150,9 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 }
 
 // Tick advances the node's logical clock by one tick. A follower or
-// candidate whose election timeout elapses starts an election, and a leader
-// sends a heartbeat every heartbeatTick ticks (Figure 2).
+// candidate whose election timeout elapses starts an election (Figure 2).
+// Every heartbeatTick ticks, a leader sends a heartbeat, and a candidate
+// asks again each server that has not answered it.
 func (n *Node) Tick() {
 	if n.role == Leader {
 		n.heartbeatElapsed++
@@ -162,6 +164,13 @@ func (n *Node) Tick() {
 	n.electionElapsed++
 	if n.electionElapsed >= n.electionTimeout {
 		n.campaign()
+		return
+	}
+	if n.role == Candidate {
+		n.heartbeatElapsed++
+		if n.heartbeatElapsed >= n.heartbeatTick {
+			n.requestVotes()
+		}
 	}
 }
 

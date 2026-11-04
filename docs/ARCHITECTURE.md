@@ -53,6 +53,7 @@ The core counts time in ticks and never sees a duration. `DefaultConfig` returns
 
 - **Election timer.** Each timeout is drawn uniformly from [`ElectionTick`, 2 × `ElectionTick`) ticks with the injected `*rand.Rand`, again at every reset (§5.2). A follower's timer restarts only when it hears an AppendEntries from the current leader or grants a vote; a candidate's restarts when it starts an election (Figure 2). A refused vote never restarts it, so a candidate that cannot win cannot hold off an election by asking.
 - **Heartbeats.** A leader sends an empty AppendEntries to every other server as soon as it is elected, then every `HeartbeatTick` ticks. `HeartbeatTick` must be below `ElectionTick`, so a follower hears from a healthy leader before it times out.
+- **Vote retries.** Servers retry RPCs that get no timely response (§5.1). Every `HeartbeatTick` ticks, a candidate sends its RequestVote again to each server that has not answered this election, so a lost request or reply costs one heartbeat interval instead of a new election and term. A server that already granted the vote grants it again, and votes are counted by voter, so a retry never counts twice.
 
 ## Messages
 
@@ -87,5 +88,5 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | --- | --- |
 | [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `HardState`, `Message` and the RPC structs, `Ready` |
 | [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Ready`, `Status`, and the three `become*` functions |
-| [`election.go`](../raft/election.go) | The election timer, `campaign`, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
+| [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
 | [`append_entries.go`](../raft/append_entries.go) | Heartbeats and the AppendEntries receiver |

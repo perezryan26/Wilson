@@ -14,9 +14,21 @@ func (n *Node) resetElectionTimer() {
 // wins at once.
 func (n *Node) campaign() {
 	n.becomeCandidate()
+	n.requestVotes()
+	if n.hasMajority() {
+		n.becomeLeader()
+	}
+}
+
+// requestVotes sends RequestVote to every server that has not answered this
+// election. Servers retry RPCs that get no timely response (§5.1), so a
+// candidate asks again every heartbeatTick ticks: a lost request or reply
+// then costs one heartbeat interval instead of a new election and term.
+func (n *Node) requestVotes() {
+	n.heartbeatElapsed = 0
 	lastIndex, lastTerm := n.lastLog()
 	for _, id := range n.peers {
-		if id == n.id {
+		if _, answered := n.votes[id]; answered {
 			continue
 		}
 		n.send(Message{To: id, RequestVote: &RequestVoteRequest{
@@ -25,9 +37,6 @@ func (n *Node) campaign() {
 			LastLogIndex: lastIndex,
 			LastLogTerm:  lastTerm,
 		}})
-	}
-	if n.hasMajority() {
-		n.becomeLeader()
 	}
 }
 
@@ -63,16 +72,17 @@ func (n *Node) replyVote(to NodeID, granted bool) {
 	}})
 }
 
-// handleRequestVoteResponse counts a granted vote and makes the candidate
-// leader once a majority has voted for it (Figure 2, candidates). Votes are
-// recorded by voter, so a duplicated response counts once.
+// handleRequestVoteResponse records a server's answer and makes the
+// candidate leader once a majority has granted it a vote (Figure 2,
+// candidates). Answers are recorded by voter and a granted vote is never
+// taken back, so a duplicated or reordered response counts once.
 func (n *Node) handleRequestVoteResponse(from NodeID, resp *RequestVoteResponse) {
-	// A vote from an earlier election, or one that arrives after this
+	// An answer from an earlier election, or one that arrives after this
 	// election is decided, has nothing left to count toward.
-	if n.role != Candidate || resp.Term != n.currentTerm || !resp.VoteGranted {
+	if n.role != Candidate || resp.Term != n.currentTerm {
 		return
 	}
-	n.votes[from] = true
+	n.votes[from] = n.votes[from] || resp.VoteGranted
 	if n.hasMajority() {
 		n.becomeLeader()
 	}
