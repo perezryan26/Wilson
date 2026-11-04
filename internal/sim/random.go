@@ -16,15 +16,17 @@ const (
 
 // RunRandomized runs one seed of the randomized schedule. A cluster of one
 // to five servers, sized by the seed, runs for ten seconds of virtual time
-// and must then agree on a leader within ten more. RunRandomized returns
-// the first violation or liveness failure.
-func RunRandomized(seed uint64) error {
-	c := New(Options{Size: 1 + int(seed%5), Seed: seed})
+// and must then agree on a leader within ten more. It returns the cluster,
+// whose trace tells what happened, and the first violation or liveness
+// failure. traceMessages adds every message to the trace.
+func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
+	c := New(Options{Size: 1 + int(seed%5), Seed: seed, TraceMessages: traceMessages})
 	if err := c.RunFor(runTime); err != nil {
-		return err
+		return c, err
 	}
-	return c.RunUntil(livenessTime, "an agreed leader", func() bool {
+	err := c.RunUntil(livenessTime, "an agreed leader", func() bool {
 		lead, _ := c.AgreedLeader()
 		return lead != raft.None
 	})
+	return c, err
 }

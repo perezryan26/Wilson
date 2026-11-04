@@ -3,6 +3,7 @@ package sim_test
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,20 +11,68 @@ import (
 	"github.com/perezryan26/wilson/raft"
 )
 
-var seeds = flag.Uint64("seeds", 20, "how many seeds TestRandomized runs")
+var (
+	seeds  = flag.Uint64("seeds", 20, "how many seeds TestRandomized runs")
+	replay = flag.Int64("seed", -1, "run only this seed of TestRandomized and log its trace, every message included")
+)
 
 // TestRandomized runs seeds 0 to N-1 of the randomized schedule in
 // parallel, where -seeds=N sets N. Each seed checks the invariants after
-// every event, then checks liveness.
+// every event, then checks liveness. A failure prints the seed's trace;
+// -seed=N replays seed N alone with every message traced.
 func TestRandomized(t *testing.T) {
+	if *replay >= 0 {
+		c, err := sim.RunRandomized(uint64(*replay), true)
+		t.Logf("seed %d trace:\n%s", *replay, c.Trace())
+		if err != nil {
+			t.Fatalf("seed %d: %v", *replay, err)
+		}
+		return
+	}
 	for seed := range *seeds {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			t.Parallel()
-			if err := sim.RunRandomized(seed); err != nil {
-				t.Fatalf("seed %d: %v", seed, err)
+			c, err := sim.RunRandomized(seed, false)
+			if err != nil {
+				t.Fatalf("seed %d: %v\n%s\nReplay it with every message traced: go test ./internal/sim -run TestRandomized -seed=%d -v",
+					seed, err, c.Trace(), seed)
 			}
 		})
 	}
+}
+
+// The simulator is deterministic: a seed run twice traces the same bytes,
+// every message included, and another seed traces differently.
+func TestSameSeedSameTrace(t *testing.T) {
+	trace := func(seed uint64) string {
+		c, err := sim.RunRandomized(seed, true)
+		if err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+		return c.Trace()
+	}
+	first, second := trace(9), trace(9)
+	if first != second {
+		t.Fatalf("seed 9 traced differently the second time, from line %d", firstDifference(first, second))
+	}
+	if !strings.Contains(first, "RequestVote ") || !strings.Contains(first, "AppendEntries ") {
+		t.Fatalf("seed 9's trace has no messages:\n%s", first)
+	}
+	if first == trace(14) {
+		t.Error("seeds 9 and 14 traced the same bytes")
+	}
+}
+
+// firstDifference returns the number of the first line where a and b
+// differ.
+func firstDifference(a, b string) int {
+	al, bl := strings.Split(a, "\n"), strings.Split(b, "\n")
+	for i := range min(len(al), len(bl)) {
+		if al[i] != bl[i] {
+			return i + 1
+		}
+	}
+	return min(len(al), len(bl)) + 1
 }
 
 // Lost, duplicated, and slow messages delay an election but never break

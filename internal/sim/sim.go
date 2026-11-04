@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/perezryan26/wilson/internal/storage"
@@ -19,6 +20,10 @@ type Options struct {
 	// Seed seeds every random choice the simulator makes, and through them
 	// every server's random source, so a seed replays a run exactly.
 	Seed uint64
+	// TraceMessages adds every message's delivery or loss to the trace,
+	// which otherwise records boots, crashes, faults, and every change of
+	// role, term, or leader.
+	TraceMessages bool
 }
 
 // Cluster is a simulated raft cluster. It runs every server in one
@@ -37,6 +42,9 @@ type Cluster struct {
 
 	leaders map[raft.Term]raft.NodeID // every leader seen, by term
 	err     error                     // the first violation, which ends the run
+
+	trace         strings.Builder
+	traceMessages bool
 }
 
 // node is one simulated server: a core while it runs, and storage that
@@ -47,6 +55,7 @@ type node struct {
 	storage storage.Memory
 	period  time.Duration // this server's tick interval
 	boots   int           // how many times the server has started
+	status  raft.Status   // as of the last event, for the trace
 
 	maxTerm raft.Term                 // highest currentTerm seen, across restarts
 	votes   map[raft.Term]raft.NodeID // every vote the server saved, by term
@@ -60,6 +69,8 @@ func New(opts Options) *Cluster {
 		net:     DefaultNetwork(),
 		blocked: map[link]bool{},
 		leaders: map[raft.Term]raft.NodeID{},
+
+		traceMessages: opts.TraceMessages,
 	}
 	_, tick := raft.DefaultConfig()
 	for i := range opts.Size {
@@ -79,7 +90,12 @@ func New(opts Options) *Cluster {
 
 // Crash stops server id. It loses everything but its storage, and messages
 // that arrive while it is down are lost.
-func (c *Cluster) Crash(id raft.NodeID) { c.node(id).core = nil }
+func (c *Cluster) Crash(id raft.NodeID) {
+	if n := c.node(id); n.core != nil {
+		n.core = nil
+		c.tracef("%s crash", name(id))
+	}
+}
 
 // Restart boots server id from its storage, if it is down.
 func (c *Cluster) Restart(id raft.NodeID) {
@@ -87,6 +103,9 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		c.boot(n)
 	}
 }
+
+// Trace returns the run's trace so far, one event per line.
+func (c *Cluster) Trace() string { return c.trace.String() }
 
 // Now returns the virtual time since the cluster started.
 func (c *Cluster) Now() time.Duration { return c.now }
@@ -199,6 +218,9 @@ func (c *Cluster) boot(n *node) {
 	cfg.Rand = rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))
 	n.core = raft.NewNode(cfg, restored)
 	n.boots++
+	n.status = n.core.Status()
+	c.tracef("%s boot term=%d votedFor=%s tick=%s", name(n.id), restored.HardState.CurrentTerm,
+		name(restored.HardState.VotedFor), ms(n.period))
 	c.tick(n, n.boots, c.now+c.randDuration(0, n.period))
 }
 
@@ -231,14 +253,18 @@ func (c *Cluster) handleReady(n *node) {
 	}
 }
 
-// observe checks, after every event, the invariants that must hold at every
-// instant.
+// observe traces every change of role, term, or leader, and checks the
+// invariants that must hold at every instant. It runs after every event.
 func (c *Cluster) observe() {
 	for _, n := range c.nodes {
 		if n.core == nil {
 			continue
 		}
 		st := n.core.Status()
+		if st != n.status {
+			c.tracef("%s %s", name(n.id), change(n.status, st))
+			n.status = st
+		}
 		c.checkTerm(n, st)
 		c.checkElectionSafety(n, st)
 	}
@@ -284,6 +310,7 @@ func (c *Cluster) checkVote(n *node, hs raft.HardState) {
 func (c *Cluster) fail(err error) {
 	if c.err == nil {
 		c.err = err
+		c.tracef("FAILED: %v", err)
 	}
 }
 

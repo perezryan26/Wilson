@@ -21,7 +21,10 @@ func DefaultNetwork() Network {
 }
 
 // SetNetwork changes how the messages sent from now on travel.
-func (c *Cluster) SetNetwork(n Network) { c.net = n }
+func (c *Cluster) SetNetwork(n Network) {
+	c.net = n
+	c.tracef("network loss=%d%% duplication=%d%% delay=%s..%s", n.LossPercent, n.DupPercent, ms(n.MinDelay), ms(n.MaxDelay))
+}
 
 // link is the one-way path from one server to another.
 type link struct{ from, to raft.NodeID }
@@ -45,23 +48,32 @@ func (c *Cluster) Partition(groups ...[]raft.NodeID) {
 			}
 		}
 	}
+	c.tracef("partition %s", groupNames(groups))
 }
 
 // Cut blocks messages from one server to another but not the reverse, as a
 // one-way network failure does.
-func (c *Cluster) Cut(from, to raft.NodeID) { c.blocked[link{from, to}] = true }
+func (c *Cluster) Cut(from, to raft.NodeID) {
+	c.blocked[link{from, to}] = true
+	c.tracef("cut %s→%s", name(from), name(to))
+}
 
 // Heal restores every link that a partition or a cut blocked.
-func (c *Cluster) Heal() { c.blocked = map[link]bool{} }
+func (c *Cluster) Heal() {
+	c.blocked = map[link]bool{}
+	c.tracef("heal")
+}
 
 // send puts m in flight: it may be lost or duplicated, and each copy
 // arrives after its own random delay.
 func (c *Cluster) send(m raft.Message) {
 	if c.rng.IntN(100) < c.net.LossPercent {
+		c.traceMessage("lost ", m)
 		return
 	}
 	copies := 1
 	if c.rng.IntN(100) < c.net.DupPercent {
+		c.traceMessage("duplicated ", m)
 		copies = 2
 	}
 	for range copies {
@@ -74,9 +86,15 @@ func (c *Cluster) send(m raft.Message) {
 // is blocked, and carries out the receiver's Ready.
 func (c *Cluster) deliver(m raft.Message) {
 	n := c.node(m.To)
-	if n.core == nil || c.blocked[link{m.From, m.To}] {
+	switch {
+	case n.core == nil:
+		c.traceMessage("down ", m)
+		return
+	case c.blocked[link{m.From, m.To}]:
+		c.traceMessage("cut ", m)
 		return
 	}
+	c.traceMessage("", m)
 	n.core.Step(m)
 	c.handleReady(n)
 }
