@@ -45,6 +45,33 @@ func (l *raftLog) between(lo, hi Index) []Entry {
 	return slices.Clone(l.entries[lo-off : hi-off+1])
 }
 
+// firstIndexOf returns the first index of the run of entries of term that
+// includes index i. Terms never decrease along a log, so the run is the
+// term's only one.
+func (l *raftLog) firstIndexOf(term Term, i Index) Index {
+	for i > 1 {
+		if t, _ := l.term(i - 1); t != term {
+			break
+		}
+		i--
+	}
+	return i
+}
+
+// lastIndexOf returns the index of the last entry of term, or 0 if the log
+// holds none.
+func (l *raftLog) lastIndexOf(term Term) Index {
+	for i := l.lastIndex(); i > 0; i-- {
+		switch t, _ := l.term(i); {
+		case t == term:
+			return i
+		case t < term:
+			return 0
+		}
+	}
+	return 0
+}
+
 // merge carries out AppendEntries receiver steps 3 and 4 for entries, which
 // follow an entry the log already matches. It keeps every entry the log
 // already holds, truncates the log at the first entry that conflicts, and

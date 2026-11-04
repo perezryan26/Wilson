@@ -213,16 +213,80 @@ func TestLeaderSendsEntriesFromNextIndex(t *testing.T) {
 	}
 }
 
-// Figure 2, leaders: when a follower refuses AppendEntries because of a log
-// inconsistency, the leader decrements its nextIndex and retries at once.
-func TestLeaderBacksUpOnRejection(t *testing.T) {
-	n := newLeaderWithLog(t, 3, 1, 1, 2)
-	for _, prev := range []Index{2, 1} {
-		n.Step(appendResponse(2, 3, false, 0))
-		req := oneAppend(t, n.Ready(), 2)
-		if req.PrevLogIndex != prev || len(req.Entries) != int(3-prev) {
-			t.Errorf("retry after entry %d with %d entries, want after entry %d with %d", req.PrevLogIndex, len(req.Entries), prev, 3-prev)
-		}
+// §5.3 and ADR-0004: when a follower refuses AppendEntries for a log
+// inconsistency, the leader backs nextIndex up past the whole conflicting
+// term the reply names, and retries at once. The leader of term 4 holds
+// terms [1 1 3 3] and first sends entry 5's predecessor, index 4.
+func TestLeaderSkipsConflictingTerm(t *testing.T) {
+	tests := []struct {
+		name          string
+		conflictTerm  Term
+		conflictIndex Index
+		prev          Index
+	}{
+		{"follower's log ends at index 2", 0, 3, 2},
+		{"follower's term 2 starts at index 2, a term the leader lacks", 2, 2, 1},
+		{"follower has term 1 at index 4; the leader's term 1 ends at 2", 1, 1, 2},
+		{"a reply pointing forward still backs up one entry", 0, 9, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := newLeaderWithLog(t, 4, 1, 1, 3, 3)
+			n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{
+				Term: 4, ConflictTerm: tt.conflictTerm, ConflictIndex: tt.conflictIndex,
+			}})
+			req := oneAppend(t, n.Ready(), 2)
+			if req.PrevLogIndex != tt.prev || len(req.Entries) != int(4-tt.prev) {
+				t.Errorf("retry after entry %d with %d entries, want after entry %d", req.PrevLogIndex, len(req.Entries), tt.prev)
+			}
+		})
+	}
+}
+
+// ADR-0004: a refusal says where the logs part. With no entry at
+// PrevLogIndex, it gives the follower's last index + 1; with an entry of
+// another term, that term and the first index the follower holds it at.
+func TestRejectionNamesConflict(t *testing.T) {
+	tests := []struct {
+		name      string
+		prevIndex Index
+		prevTerm  Term
+		want      AppendEntriesResponse
+	}{
+		{"no entry at prevLogIndex", 7, 3, AppendEntriesResponse{Term: 3, ConflictIndex: 6}},
+		{"term 2 where the leader has 3", 4, 3, AppendEntriesResponse{Term: 3, ConflictTerm: 2, ConflictIndex: 3}},
+		{"term 1 where the leader has 2", 2, 2, AppendEntriesResponse{Term: 3, ConflictTerm: 1, ConflictIndex: 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := newFollower(2, 1, 1, 2, 2, 2)
+			n.Step(appendFrom(3, tt.prevIndex, tt.prevTerm, nil, 0))
+			if got := appendReply(t, n.Ready(), 2); got != tt.want {
+				t.Errorf("reply = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A follower whose log diverges over many entries but few terms converges
+// in round trips per term, not per entry: one rejection here, where backing
+// up one entry at a time would take fifty.
+func TestDivergentLogConvergesPerTerm(t *testing.T) {
+	repeat := func(term Term, n int) []Term { return slices.Repeat([]Term{term}, n) }
+	leaderLog := slices.Concat(repeat(1, 100), repeat(3, 50))
+	leader := newLeaderWithLog(t, 4, leaderLog...)
+	follower := NewNode(testConfig(2, 3, 1), RestoredState{
+		HardState: HardState{CurrentTerm: 2},
+		Entries:   logOf(slices.Concat(repeat(1, 100), repeat(2, 100))...),
+	})
+	if _, _, err := leader.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if got := exchange(t, leader, follower); got != 1 {
+		t.Errorf("converged after %d rejections, want 1: one per conflicting term", got)
+	}
+	if got, want := logTerms(follower), logTerms(leader); !slices.Equal(got, want) {
+		t.Errorf("follower log does not match the leader's: %d entries, want %d", len(got), len(want))
 	}
 }
 
@@ -288,19 +352,21 @@ func exchange(t *testing.T, nodes ...*Node) int {
 // Figure 7: whatever the follower's log looks like when a leader of term 8
 // comes to power, missing entries (a, b), extra entries (c, d), or both
 // (e, f), the follower's log ends up identical to the leader's once the
-// leader appends an entry of its own term.
+// leader appends an entry of its own term, after one rejection per
+// conflicting term.
 func TestFigure7FollowersConverge(t *testing.T) {
 	leaderLog := []Term{1, 1, 1, 4, 4, 5, 5, 6, 6, 6}
 	tests := []struct {
-		name string
-		log  []Term
+		name       string
+		log        []Term
+		rejections int // with fast backtracking: one per conflicting term
 	}{
-		{"a", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6}},
-		{"b", []Term{1, 1, 1, 4}},
-		{"c", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 6}},
-		{"d", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 7, 7}},
-		{"e", []Term{1, 1, 1, 4, 4, 4, 4}},
-		{"f", []Term{1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}},
+		{"a", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6}, 1},
+		{"b", []Term{1, 1, 1, 4}, 1},
+		{"c", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 6}, 0},
+		{"d", []Term{1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 7, 7}, 0},
+		{"e", []Term{1, 1, 1, 4, 4, 4, 4}, 2},
+		{"f", []Term{1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}, 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -312,7 +378,9 @@ func TestFigure7FollowersConverge(t *testing.T) {
 			if _, _, err := leader.Propose([]byte("x")); err != nil {
 				t.Fatal(err)
 			}
-			exchange(t, leader, follower)
+			if got := exchange(t, leader, follower); got != tt.rejections {
+				t.Errorf("converged after %d rejections, want %d", got, tt.rejections)
+			}
 			if got, want := logTerms(follower), logTerms(leader); !slices.Equal(got, want) {
 				t.Errorf("follower log terms = %v, want the leader's %v", got, want)
 			}

@@ -52,7 +52,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm (§5.3).
 	if term, ok := n.log.term(req.PrevLogIndex); !ok || term != req.PrevLogTerm {
-		n.rejectAppend(req.LeaderID)
+		n.rejectConflict(req.LeaderID, req.PrevLogIndex)
 		return
 	}
 	// 3. If an existing entry conflicts with a new one (same index but
@@ -77,6 +77,18 @@ func (n *Node) rejectAppend(to NodeID) {
 	n.send(Message{To: to, AppendEntriesResponse: &AppendEntriesResponse{Term: n.currentTerm}})
 }
 
+// rejectConflict refuses an AppendEntries whose PrevLogIndex entry this log
+// lacks or holds with another term, and says where the logs part
+// (docs/adr/0004-fast-log-backtracking.md).
+func (n *Node) rejectConflict(to NodeID, prevIndex Index) {
+	resp := &AppendEntriesResponse{Term: n.currentTerm, ConflictIndex: n.log.lastIndex() + 1}
+	if prevIndex <= n.log.lastIndex() {
+		resp.ConflictTerm, _ = n.log.term(prevIndex)
+		resp.ConflictIndex = n.log.firstIndexOf(resp.ConflictTerm, prevIndex)
+	}
+	n.send(Message{To: to, AppendEntriesResponse: resp})
+}
+
 // handleAppendEntriesResponse applies Figure 2's rules for a leader that
 // hears back from a follower: on success it moves the follower's matchIndex
 // and nextIndex forward, and on a rejection it backs nextIndex up and
@@ -89,8 +101,11 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	}
 	if !resp.Success {
 		// The follower's log lacks or contradicts the entry at PrevLogIndex
-		// (§5.3). Earlier entries never need resending to it.
-		n.nextIndex[from] = max(n.nextIndex[from]-1, n.matchIndex[from]+1)
+		// (§5.3). Back up past the whole conflict, but always by at least
+		// one entry, so even an odd reply cannot stall the search, and never
+		// to entries the follower is known to hold.
+		next := min(n.nextIndex[from]-1, n.backtrack(resp))
+		n.nextIndex[from] = max(next, n.matchIndex[from]+1)
 		n.sendAppend(from)
 		return
 	}
@@ -105,6 +120,19 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	if n.nextIndex[from] <= n.log.lastIndex() {
 		n.sendAppend(from)
 	}
+}
+
+// backtrack returns the nextIndex a rejection points to: just past the
+// leader's last entry of ConflictTerm if it has that term, and otherwise
+// ConflictIndex, where the follower's run of that term begins or its log
+// ends (docs/adr/0004-fast-log-backtracking.md).
+func (n *Node) backtrack(resp *AppendEntriesResponse) Index {
+	if resp.ConflictTerm != 0 {
+		if last := n.log.lastIndexOf(resp.ConflictTerm); last > 0 {
+			return last + 1
+		}
+	}
+	return resp.ConflictIndex
 }
 
 // maybeCommit sets commitIndex to the highest index a majority of servers

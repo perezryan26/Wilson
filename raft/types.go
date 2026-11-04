@@ -97,6 +97,16 @@ type AppendEntriesResponse struct {
 	// acknowledges because replies can arrive late, twice, or out of order,
 	// so the leader cannot assume a reply answers what it last sent.
 	MatchIndex Index
+
+	// ConflictTerm and ConflictIndex say, on a rejection for a log
+	// inconsistency, where the logs part, so the leader can skip a whole
+	// conflicting term per round trip (§5.3;
+	// docs/adr/0004-fast-log-backtracking.md). ConflictTerm is the term of
+	// the follower's entry at PrevLogIndex, or 0 if it has none, and
+	// ConflictIndex is the first index of that term in its log, or its last
+	// index + 1.
+	ConflictTerm  Term
+	ConflictIndex Index
 }
 
 // Ready holds the effects a node produced since the previous call to
