@@ -38,7 +38,7 @@ func name(id raft.NodeID) string {
 }
 
 // change prints a server's status, marking each field that changed since
-// was as old→new.
+// was as old→new. commitIndex and lastApplied appear only when they moved.
 func change(was, now raft.Status) string {
 	role, term, leader := now.Role.String(), fmt.Sprint(now.Term), name(now.Leader)
 	if was.Role != now.Role {
@@ -50,7 +50,14 @@ func change(was, now raft.Status) string {
 	if was.Leader != now.Leader {
 		leader = name(was.Leader) + "→" + leader
 	}
-	return fmt.Sprintf("%s term=%s leader=%s", role, term, leader)
+	s := fmt.Sprintf("%s term=%s leader=%s", role, term, leader)
+	if was.CommitIndex != now.CommitIndex {
+		s += fmt.Sprintf(" commitIndex=%d→%d", was.CommitIndex, now.CommitIndex)
+	}
+	if was.LastApplied != now.LastApplied {
+		s += fmt.Sprintf(" lastApplied=%d→%d", was.LastApplied, now.LastApplied)
+	}
+	return s
 }
 
 // describe prints m's RPC with the paper's field names.
@@ -65,12 +72,26 @@ func describe(m raft.Message) string {
 		return fmt.Sprintf("RequestVoteResponse term=%d voteGranted=%t", r.Term, r.VoteGranted)
 	case m.AppendEntries != nil:
 		r := m.AppendEntries
-		return fmt.Sprintf("AppendEntries term=%d leaderId=%d", r.Term, r.LeaderID)
+		return fmt.Sprintf("AppendEntries term=%d leaderId=%d prevLogIndex=%d prevLogTerm=%d entries=%s leaderCommit=%d",
+			r.Term, r.LeaderID, r.PrevLogIndex, r.PrevLogTerm, entryNames(r.Entries), r.LeaderCommit)
 	case m.AppendEntriesResponse != nil:
 		r := m.AppendEntriesResponse
-		return fmt.Sprintf("AppendEntriesResponse term=%d success=%t", r.Term, r.Success)
+		if r.Success {
+			return fmt.Sprintf("AppendEntriesResponse term=%d success=true matchIndex=%d", r.Term, r.MatchIndex)
+		}
+		return fmt.Sprintf("AppendEntriesResponse term=%d success=false conflictTerm=%d conflictIndex=%d",
+			r.Term, r.ConflictTerm, r.ConflictIndex)
 	}
 	return "empty message"
+}
+
+// entryNames prints entries as [index@term ...], such as [8@4 9@4].
+func entryNames(entries []raft.Entry) string {
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = fmt.Sprintf("%d@%d", e.Index, e.Term)
+	}
+	return "[" + strings.Join(names, " ") + "]"
 }
 
 // groupNames prints partition groups as "n1 n2 | n3 n4 n5".

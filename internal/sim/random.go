@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"fmt"
 	"slices"
 	"time"
 
@@ -18,13 +19,16 @@ const (
 // RunRandomized runs one seed of the randomized schedule. A cluster of one
 // to five servers, sized by the seed, spends ten seconds of virtual time
 // under faults the seed chooses: partitions, one-way cuts, crashes,
-// restarts, and networks that lose, duplicate, and delay messages. Then
-// every fault heals, and the servers must agree on a leader within ten
-// seconds. RunRandomized returns the cluster, whose trace tells what
-// happened, and the first violation or liveness failure. traceMessages
-// adds every message to the trace.
+// restarts, and networks that lose, duplicate, and delay messages. All the
+// while, a client proposes commands to whichever servers believe they
+// lead. Then every fault heals, and within ten seconds the servers must
+// agree on a leader, and within ten more apply a command proposed to it.
+// RunRandomized returns the cluster, whose trace tells what happened, and
+// the first violation or liveness failure. traceMessages adds every
+// message to the trace.
 func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 	c := New(Options{Size: 1 + int(seed%5), Seed: seed, TraceMessages: traceMessages})
+	c.runClient()
 	for c.now < faultTime {
 		if err := c.RunFor(c.randDuration(50*time.Millisecond, time.Second)); err != nil {
 			return c, err
@@ -32,11 +36,59 @@ func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 		c.randomFault()
 	}
 	c.healAll()
+	return c, c.checkLiveness()
+}
+
+// checkLiveness requires the healed cluster to make progress: the servers
+// agree on a leader, and a command proposed to it is applied everywhere,
+// along with every entry before it in the leader's log.
+func (c *Cluster) checkLiveness() error {
+	var lead raft.NodeID
 	err := c.RunUntil(livenessTime, "an agreed leader after healing", func() bool {
-		lead, _ := c.AgreedLeader()
+		lead, _ = c.AgreedLeader()
 		return lead != raft.None
 	})
-	return c, err
+	if err != nil {
+		return err
+	}
+	index, _, err := c.Propose(lead, c.command())
+	if err != nil {
+		return err
+	}
+	return c.RunUntil(livenessTime, fmt.Sprintf("every server to apply entry %d", index), func() bool {
+		for _, id := range c.ids() {
+			if st, up := c.Status(id); !up || st.LastApplied < index {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// runClient proposes a new command every 10 to 200 ms, for the rest of the
+// run, to a server that believes it leads, if any does. A stale leader
+// accepts commands that a later leader overwrites, which is the point.
+func (c *Cluster) runClient() {
+	c.schedule(c.now+c.randDuration(10*time.Millisecond, 200*time.Millisecond), func() {
+		var leaders []raft.NodeID
+		for _, id := range c.ids() {
+			if st, up := c.Status(id); up && st.Role == raft.Leader {
+				leaders = append(leaders, id)
+			}
+		}
+		if len(leaders) > 0 {
+			// A server that believes it leads accepts the command.
+			_, _, _ = c.Propose(leaders[c.rng.IntN(len(leaders))], c.command())
+		}
+		c.runClient()
+	})
+}
+
+// command returns a command no other proposal in the run uses, so that two
+// entries with the same command are the same entry.
+func (c *Cluster) command() []byte {
+	c.commands++
+	return []byte(fmt.Sprintf("v%d", c.commands))
 }
 
 // randomFault injects one fault: a partition or a heal, a one-way cut, a

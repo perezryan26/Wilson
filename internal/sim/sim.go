@@ -36,6 +36,8 @@ type Cluster struct {
 	queue queue
 	seq   uint64 // events scheduled so far
 
+	commands int // commands proposed so far, for naming the next
+
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
 	blocked map[link]bool // links cut by a partition or a cut
@@ -95,6 +97,25 @@ func (c *Cluster) Crash(id raft.NodeID) {
 		n.core = nil
 		c.tracef("%s crash", name(id))
 	}
+}
+
+// Propose hands cmd to server id, as a client would, and carries out the
+// server's Ready. It returns the new entry's index and term, or
+// raft.ErrNotLeader, or an error if the server is down.
+func (c *Cluster) Propose(id raft.NodeID, cmd []byte) (raft.Index, raft.Term, error) {
+	n := c.node(id)
+	if n.core == nil {
+		return 0, 0, fmt.Errorf("server %d is down", id)
+	}
+	index, term, err := n.core.Propose(cmd)
+	if err != nil {
+		c.tracef("%s propose %s: %v", name(id), cmd, err)
+		return 0, 0, err
+	}
+	c.tracef("%s propose %s: index=%d term=%d", name(id), cmd, index, term)
+	c.handleReady(n)
+	c.observe()
+	return index, term, nil
 }
 
 // Restart boots server id from its storage, if it is down.
