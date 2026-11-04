@@ -43,7 +43,7 @@ for each input, a tick or an inbound message {
 }
 ```
 
-Today the only driver is the three-node test harness in [`raft/cluster_test.go`](../raft/cluster_test.go). It runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The runtime in `node/` is not written yet.
+Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages ([TESTING.md](TESTING.md#deterministic-simulator)). The runtime in `node/` is not written yet.
 
 `NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term with that vote.
 

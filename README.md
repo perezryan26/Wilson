@@ -2,13 +2,13 @@
 
 A linearizable key-value store built on the Raft consensus algorithm, written in Go from scratch and meant to be read beside the [extended Raft paper](https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf).
 
-> **Status: leader election.** The Raft core elects a leader and replaces one that fails, shown by unit tests and a three-node test harness. Log replication, durable storage, the runtime, and the key-value service are not written yet. Each section below says what exists today.
+> **Status: leader election.** The Raft core elects a leader and replaces one that fails, shown by unit tests, a three-node test harness, and a deterministic simulator that injects partitions, crashes, and message faults. Log replication, durable storage, the runtime, and the key-value service are not written yet. Each section below says what exists today.
 
 ## Overview and guarantees
 
 Wilson is a replicated key-value store that keeps serving Get, Put, and Delete while a majority of its servers are up. It implements §5–§8 of the paper by Ongaro and Ousterhout: leader election, log replication, safety, membership changes, log compaction, and client interaction. The code is written to be read and maintained by people, with the paper open beside it.
 
-The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far only Election Safety has evidence: unit tests, and a three-node harness that checks it after every step (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
+The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far only Election Safety has evidence: unit tests, a three-node harness, and the deterministic simulator, which checks it after every event under thousands of randomized fault schedules (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
 
 | Guarantee | Meaning | Verified by |
 | --- | --- | --- |
@@ -64,7 +64,7 @@ The Raft algorithm lives in a deterministic core with no goroutines, clock, disk
 
 Only `node/` touches time, disk, and the network. The simulator and the MIT 6.5840 test adapter take its place, each with its own clock, storage, and network.
 
-Every package below exists with its package documentation. Only `raft/` and `internal/storage/` have code so far.
+Every package below exists with its package documentation. Only `raft/`, `internal/storage/`, and `internal/sim/` have code so far.
 
 - **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs. So far it implements leader election: the three roles, the randomized election timer, RequestVote, and heartbeats. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes its contract with the runtime.
 - **`node/`** is the runtime. One goroutine feeds the core ticks, inbound messages, and proposals, then handles each `Ready` in order: persist and fsync, send, apply. A storage error stops the process.
@@ -73,7 +73,7 @@ Every package below exists with its package documentation. Only `raft/` and `int
 - **`internal/kv/`** is the replicated state machine: the command encoding, Get, Put, and Delete, and the per-client session table that makes retried writes apply once.
 - **`internal/kvserver/`** is the client-facing HTTP API. It proposes commands, waits for them to apply, and points clients at the leader.
 - **`client/`** is the Go client library: leader discovery, retries, client IDs, and sequence numbers.
-- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event.
+- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event. So far it checks Election Safety, that terms never fall, and one vote per term, plus liveness once faults heal.
 - **`internal/linearizability/`** holds the Porcupine model and the history recorder.
 - **`cmd/kvnode/`** and **`cmd/kvctl/`** are the server and CLI binaries.
 - **`test/chaos/`** is the multi-process chaos test.
@@ -82,7 +82,7 @@ Every package below exists with its package documentation. Only `raft/` and `int
 
 ## Paper-to-code map
 
-Each row names a concept or rule from the paper, the function that implements it, and the tests that cover it. The rows cover leader election: §5.1, §5.2, and the election rules of Figure 2. Every test named here is in `raft/`.
+Each row names a concept or rule from the paper, the function that implements it, and the tests that cover it. The rows cover leader election: §5.1, §5.2, and the election rules of Figure 2. Every test named here is in `raft/`, except those marked (sim), which are in `internal/sim/`.
 
 | Paper | Rule | Code | Tests |
 | --- | --- | --- | --- |
@@ -105,8 +105,10 @@ Each row names a concept or rule from the paper, the function that implements it
 | Figure 2, candidates | If the election timeout elapses, start a new election | [`Node.Tick`](raft/node.go), [`campaign`](raft/election.go) | `TestSplitVoteStartsNewElection` |
 | Figure 2, leaders | Upon election, send an empty AppendEntries (heartbeat) to each server; repeat during idle periods to prevent election timeouts | [`becomeLeader`](raft/node.go), [`broadcastHeartbeat`](raft/append_entries.go) | `TestLeaderSendsHeartbeats`, `TestHeartbeatsSuppressElection` |
 | §5.2 | Election timeouts are chosen at random from a fixed interval, [T, 2T), again for every election | [`resetElectionTimer`](raft/election.go) | `TestElectionTimeoutInRange` |
-| §5.2; Figure 3, Election Safety | At most one leader per term, because each server votes once per term and a winner needs a majority | [`hasMajority`](raft/election.go); a leader that meets a rival of its term panics in [`handleAppendEntries`](raft/append_entries.go) | `TestClusterElectsOneLeader`, `TestTwoLeadersInOneTermPanics` |
-| §5.2 | When the leader fails, the remaining majority elects a new one in a later term | The rules above, together | `TestClusterReplacesFailedLeader` |
+| §5.2; Figure 3, Election Safety | At most one leader per term, because each server votes once per term and a winner needs a majority | [`hasMajority`](raft/election.go); a leader that meets a rival of its term panics in [`handleAppendEntries`](raft/append_entries.go) | `TestClusterElectsOneLeader`, `TestTwoLeadersInOneTermPanics`, `TestRandomized` (sim) |
+| §5.2 | A minority partition never elects a leader, however high its terms climb | [`hasMajority`](raft/election.go) | `TestMinorityPartitionNeverElects` (sim) |
+| §5.2 | When the leader fails, the remaining majority elects a new one in a later term | The rules above, together | `TestClusterReplacesFailedLeader`, `TestCrashedLeaderIsReplaced` (sim) |
+| §5.1, §5.2 | A leader cut off from the majority is replaced in a later term, and steps down when it hears that term | The rules above, together | `TestIsolatedLeaderIsReplaced` (sim) |
 
 ## Verification
 
@@ -115,15 +117,13 @@ Six independent harnesses produce the evidence for correctness, and no single on
 | Harness | What it catches | How to run | State |
 | --- | --- | --- | --- |
 | Race detector | Data races in the runtime, transport, kvserver, and client | `make test` | Runs every test; the code so far is single-threaded |
-| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Not built |
+| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Checks Election Safety, terms, and votes after every event, and liveness after faults heal |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | Private adapter | Not built |
 | Porcupine | Client histories that are not linearizable | Inside the simulator and chaos tests | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | `make fuzz FUZZTIME=60s` | Wired; no targets yet |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Not built | Not built |
 
-Until the simulator exists, the evidence for leader election comes from unit tests that drive one core with `Tick` and `Step`, and from a synchronous three-node harness that runs whole elections, crashes and restarts the leader, and checks Election Safety after every step, over 1,000 seeds per test. [docs/TESTING.md](docs/TESTING.md#unit-tests-and-the-election-harness) describes both.
-
-Once the simulator exists, every failing seed prints its trace, and `go test ./internal/sim -run TestRandomized -seed=N` replays it exactly.
+The deterministic simulator runs whole clusters on a virtual clock under randomized partitions, crashes, restarts, and lossy, duplicating, slow networks, and checks the invariants after every event. A failing seed prints its trace, and `go test ./internal/sim -run TestRandomized -seed=N -v` replays it exactly, every message included. Unit tests drive one core with `Tick` and `Step`, and a synchronous three-node harness in `raft/` runs whole elections. [docs/TESTING.md](docs/TESTING.md) describes each, and how to read a trace.
 
 ## Deviations from the paper
 
@@ -177,7 +177,7 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 
 **Commits.** Subjects take the form `<area>: <imperative summary>`, and every commit carries a `Phase: N` trailer. [CONTRIBUTING.md](CONTRIBUTING.md) has the full conventions.
 
-**CI.** GitHub Actions runs `make check` on every push and pull request ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+**CI.** GitHub Actions runs `make check` on every push and pull request ([.github/workflows/ci.yml](.github/workflows/ci.yml)), and every night 50,000 simulator seeds and ten minutes of fuzzing per target ([.github/workflows/nightly.yml](.github/workflows/nightly.yml)).
 
 ## Phase history
 
@@ -185,3 +185,4 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | --- | --- | --- |
 | `phase-0` | 2026-10-27 | Module and package layout, Makefile, lint configuration, CI, contributing and testing guides, ADR-0001 (deterministic core) and ADR-0002 (HTTP/JSON transport) |
 | `phase-1` | 2026-10-27 | Core types and leader election: the three roles, the randomized election timer, RequestVote, heartbeats, in-memory storage, a three-node election harness, and `docs/ARCHITECTURE.md` |
+| `phase-2` | 2026-11-03 | The deterministic simulator: a virtual clock, a seeded event queue, message loss, duplication, and delay, partitions, crashes, restarts, invariant checks after every event, liveness after healing, traces, seed replay, and a nightly 50,000-seed sweep; candidates re-send unanswered RequestVotes |
