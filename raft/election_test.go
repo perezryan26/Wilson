@@ -263,12 +263,12 @@ func TestHigherTermInRequestStepsDown(t *testing.T) {
 		status Status
 		hs     HardState
 	}{
-		{"follower, RequestVote", follower, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
-		{"candidate, RequestVote", candidate, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
-		{"leader, RequestVote", leader, voteRequest(3, 5, 0, 0), Status{Follower, 5, None}, HardState{5, 3}},
-		{"follower, AppendEntries", follower, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
-		{"candidate, AppendEntries", candidate, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
-		{"leader, AppendEntries", leader, heartbeat(3, 5), Status{Follower, 5, 3}, HardState{5, None}},
+		{"follower, RequestVote", follower, voteRequest(3, 5, 0, 0), Status{Role: Follower, Term: 5}, HardState{5, 3}},
+		{"candidate, RequestVote", candidate, voteRequest(3, 5, 0, 0), Status{Role: Follower, Term: 5}, HardState{5, 3}},
+		{"leader, RequestVote", leader, voteRequest(3, 5, 0, 0), Status{Role: Follower, Term: 5}, HardState{5, 3}},
+		{"follower, AppendEntries", follower, heartbeat(3, 5), Status{Role: Follower, Term: 5, Leader: 3}, HardState{5, None}},
+		{"candidate, AppendEntries", candidate, heartbeat(3, 5), Status{Role: Follower, Term: 5, Leader: 3}, HardState{5, None}},
+		{"leader, AppendEntries", leader, heartbeat(3, 5), Status{Role: Follower, Term: 5, Leader: 3}, HardState{5, None}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

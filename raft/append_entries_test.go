@@ -10,11 +10,11 @@ func wantHeartbeats(t *testing.T, rd Ready, size int, term Term) {
 	if len(rd.Messages) != size-1 {
 		t.Fatalf("Ready has %d messages, want %d heartbeats", len(rd.Messages), size-1)
 	}
-	want := AppendEntriesRequest{Term: term, LeaderID: 1}
 	for i, m := range rd.Messages {
 		to := NodeID(i + 2)
-		if m.From != 1 || m.To != to || m.AppendEntries == nil || *m.AppendEntries != want {
-			t.Errorf("message %d from %d to %d is not heartbeat %+v to %d", i, m.From, m.To, want, to)
+		req := m.AppendEntries
+		if m.From != 1 || m.To != to || req == nil || req.Term != term || req.LeaderID != 1 || len(req.Entries) != 0 {
+			t.Errorf("message %d from %d to %d is not a heartbeat of term %d to %d", i, m.From, m.To, term, to)
 		}
 	}
 }

@@ -76,16 +76,27 @@ type RequestVoteResponse struct {
 }
 
 // AppendEntriesRequest holds the arguments of the AppendEntries RPC, which
-// a leader sends as a heartbeat to keep its authority (§5.2, Figure 2).
+// a leader sends to replicate log entries (§5.3) and, with no entries, as a
+// heartbeat (§5.2).
 type AppendEntriesRequest struct {
-	Term     Term   // leader's term
-	LeaderID NodeID // so the follower can redirect clients
+	Term         Term    // leader's term
+	LeaderID     NodeID  // so the follower can redirect clients
+	PrevLogIndex Index   // index of the log entry immediately preceding new ones
+	PrevLogTerm  Term    // term of the PrevLogIndex entry
+	Entries      []Entry // log entries to store; empty for a heartbeat
+	LeaderCommit Index   // leader's commitIndex
 }
 
 // AppendEntriesResponse holds the results of the AppendEntries RPC.
 type AppendEntriesResponse struct {
 	Term    Term // currentTerm, for the leader to update itself
-	Success bool // false when the request's term was stale
+	Success bool // true if the follower held an entry matching PrevLogIndex and PrevLogTerm
+
+	// MatchIndex is, on success, the index of the last entry the request
+	// carried, PrevLogIndex + len(Entries). The reply names what it
+	// acknowledges because replies can arrive late, twice, or out of order,
+	// so the leader cannot assume a reply answers what it last sent.
+	MatchIndex Index
 }
 
 // Ready holds the effects a node produced since the previous call to

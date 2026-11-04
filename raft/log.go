@@ -38,6 +38,22 @@ func (l *raftLog) append(e Entry) { l.entries = append(l.entries, e) }
 // out in a message or a Ready.
 func (l *raftLog) from(i Index) []Entry { return slices.Clone(l.entries[i-l.entries[0].Index:]) }
 
+// merge carries out AppendEntries receiver steps 3 and 4 for entries, which
+// follow an entry the log already matches. It keeps every entry the log
+// already holds, truncates the log at the first entry that conflicts, and
+// appends the rest, so a stale or repeated request truncates nothing. It
+// returns the index of the first entry it wrote, or lastIndex+1 if none.
+func (l *raftLog) merge(entries []Entry) Index {
+	for i, e := range entries {
+		if term, ok := l.term(e.Index); ok && term == e.Term {
+			continue
+		}
+		l.entries = append(l.entries[:e.Index-l.entries[0].Index], entries[i:]...)
+		return e.Index
+	}
+	return l.lastIndex() + 1
+}
+
 // term returns the term of the entry at index i, and false if the log has
 // no entry there. Index 0 is the sentinel, of term 0.
 func (l *raftLog) term(i Index) (Term, bool) {

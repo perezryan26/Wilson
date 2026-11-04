@@ -2,29 +2,39 @@ package raft
 
 import "fmt"
 
-// broadcastHeartbeat sends an AppendEntries with no entries to every other
-// server, so that followers keep recognizing this leader and do not start
-// an election (§5.2).
-func (n *Node) broadcastHeartbeat() {
+// broadcastAppend sends AppendEntries to every other server.
+func (n *Node) broadcastAppend() {
 	n.heartbeatElapsed = 0
 	for _, id := range n.peers {
-		if id == n.id {
-			continue
+		if id != n.id {
+			n.sendAppend(id)
 		}
-		n.send(Message{To: id, AppendEntries: &AppendEntriesRequest{
-			Term:     n.currentTerm,
-			LeaderID: n.id,
-		}})
 	}
 }
 
-// handleAppendEntries is Figure 2's AppendEntries receiver for a heartbeat.
-// Step has already adopted a later term, so req.Term is at most currentTerm
-// here.
+// sendAppend sends server to an AppendEntries carrying every entry from its
+// nextIndex on (Figure 2, leaders), or none when it already has them all,
+// which makes it a heartbeat (§5.2). Every heartbeat therefore also retries
+// whatever a lost message failed to deliver.
+func (n *Node) sendAppend(to NodeID) {
+	next := n.nextIndex[to]
+	prevTerm, _ := n.log.term(next - 1)
+	n.send(Message{To: to, AppendEntries: &AppendEntriesRequest{
+		Term:         n.currentTerm,
+		LeaderID:     n.id,
+		PrevLogIndex: next - 1,
+		PrevLogTerm:  prevTerm,
+		Entries:      n.log.from(next),
+		LeaderCommit: n.commitIndex,
+	}})
+}
+
+// handleAppendEntries is Figure 2's AppendEntries receiver. Step has already
+// adopted a later term, so req.Term is at most currentTerm here.
 func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 	// 1. Reply false if term < currentTerm (§5.1).
 	if req.Term < n.currentTerm {
-		n.replyAppendEntries(req.LeaderID, false)
+		n.rejectAppend(req.LeaderID)
 		return
 	}
 	if n.role == Leader {
@@ -36,12 +46,67 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 	// timer (Figure 2, followers). The vote cast in this term stands.
 	n.becomeFollower(n.currentTerm, req.LeaderID)
 	n.resetElectionTimer()
-	n.replyAppendEntries(req.LeaderID, true)
+	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
+	// term matches prevLogTerm (§5.3).
+	if term, ok := n.log.term(req.PrevLogIndex); !ok || term != req.PrevLogTerm {
+		n.rejectAppend(req.LeaderID)
+		return
+	}
+	// 3. If an existing entry conflicts with a new one (same index but
+	// different terms), delete the existing entry and all that follow it.
+	// 4. Append any new entries not already in the log.
+	n.unstable = min(n.unstable, n.log.merge(req.Entries))
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit,
+	// index of last new entry). That is the request's last entry, not the
+	// log's: any entries after it may still be overwritten.
+	lastNew := req.PrevLogIndex + Index(len(req.Entries))
+	n.commitTo(min(req.LeaderCommit, lastNew))
+	// The new entries leave in the same Ready as this reply, and the runtime
+	// persists them before it sends it.
+	n.send(Message{To: req.LeaderID, AppendEntriesResponse: &AppendEntriesResponse{
+		Term:       n.currentTerm,
+		Success:    true,
+		MatchIndex: lastNew,
+	}})
 }
 
-func (n *Node) replyAppendEntries(to NodeID, success bool) {
-	n.send(Message{To: to, AppendEntriesResponse: &AppendEntriesResponse{
-		Term:    n.currentTerm,
-		Success: success,
-	}})
+func (n *Node) rejectAppend(to NodeID) {
+	n.send(Message{To: to, AppendEntriesResponse: &AppendEntriesResponse{Term: n.currentTerm}})
+}
+
+// handleAppendEntriesResponse applies Figure 2's rules for a leader that
+// hears back from a follower: on success it moves the follower's matchIndex
+// and nextIndex forward, and on a rejection it backs nextIndex up and
+// retries.
+func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesResponse) {
+	// A reply from an earlier term answers an earlier leader. Step has
+	// already stepped down for a later one.
+	if n.role != Leader || resp.Term != n.currentTerm {
+		return
+	}
+	if !resp.Success {
+		// The follower's log lacks or contradicts the entry at PrevLogIndex
+		// (§5.3). Earlier entries never need resending to it.
+		n.nextIndex[from] = max(n.nextIndex[from]-1, n.matchIndex[from]+1)
+		n.sendAppend(from)
+		return
+	}
+	// A late or repeated reply acknowledges no more than one already
+	// counted, and matchIndex never moves back.
+	if resp.MatchIndex <= n.matchIndex[from] {
+		return
+	}
+	n.matchIndex[from] = resp.MatchIndex
+	n.nextIndex[from] = resp.MatchIndex + 1
+	if n.nextIndex[from] <= n.log.lastIndex() {
+		n.sendAppend(from)
+	}
+}
+
+// commitTo raises commitIndex to i, never lowering it (Figure 2: it
+// increases monotonically).
+func (n *Node) commitTo(i Index) {
+	if i > n.commitIndex {
+		n.commitIndex = i
+	}
 }

@@ -97,9 +97,10 @@ func (r Role) String() string {
 // Status is a read-only snapshot of a node's state, for tests, traces, and
 // log lines.
 type Status struct {
-	Role   Role
-	Term   Term   // currentTerm
-	Leader NodeID // the leader of Term as far as this node knows, or None
+	Role        Role
+	Term        Term   // currentTerm
+	Leader      NodeID // the leader of Term as far as this node knows, or None
+	CommitIndex Index  // highest log index known to be committed
 }
 
 // Node is one Raft server as a deterministic state machine: it reads no
@@ -117,6 +118,12 @@ type Node struct {
 	currentTerm Term
 	votedFor    NodeID
 	log         raftLog
+
+	commitIndex Index // volatile, as in Figure 2: a restarted server relearns it
+
+	// Volatile state on leaders, reinitialized after each election.
+	nextIndex  map[NodeID]Index // the next log index to send each server
+	matchIndex map[NodeID]Index // the highest index known replicated on each server
 
 	role   Role
 	leader NodeID          // see Status.Leader
@@ -164,7 +171,7 @@ func (n *Node) Tick() {
 	if n.role == Leader {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.heartbeatTick {
-			n.broadcastHeartbeat()
+			n.broadcastAppend()
 		}
 		return
 	}
@@ -195,8 +202,9 @@ func (n *Node) Step(m Message) {
 		n.handleRequestVoteResponse(m.From, m.RequestVoteResponse)
 	case m.AppendEntries != nil:
 		n.handleAppendEntries(m.AppendEntries)
+	case m.AppendEntriesResponse != nil:
+		n.handleAppendEntriesResponse(m.From, m.AppendEntriesResponse)
 	}
-	// A heartbeat's response matters only for its term, handled above.
 }
 
 // Propose appends cmd to the leader's log as a new entry of the current
@@ -209,6 +217,7 @@ func (n *Node) Propose(cmd []byte) (Index, Term, error) {
 	}
 	e := Entry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Data: cmd}
 	n.log.append(e)
+	n.broadcastAppend()
 	return e.Index, e.Term, nil
 }
 
@@ -231,7 +240,7 @@ func (n *Node) Ready() Ready {
 
 // Status returns the node's role, term, and leader.
 func (n *Node) Status() Status {
-	return Status{Role: n.role, Term: n.currentTerm, Leader: n.leader}
+	return Status{Role: n.role, Term: n.currentTerm, Leader: n.leader, CommitIndex: n.commitIndex}
 }
 
 // send queues m for the next Ready.
@@ -264,10 +273,16 @@ func (n *Node) becomeCandidate() {
 	n.resetElectionTimer()
 }
 
-// becomeLeader makes the node the leader of its current term and sends the
-// initial heartbeat that establishes its authority (Figure 2, leaders).
+// becomeLeader makes the node the leader of its current term, resets its
+// view of every follower's log, and sends the initial heartbeat that
+// establishes its authority (Figure 2, leaders).
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.leader = n.id
-	n.broadcastHeartbeat()
+	n.nextIndex = map[NodeID]Index{}
+	n.matchIndex = map[NodeID]Index{}
+	for _, id := range n.peers {
+		n.nextIndex[id] = n.log.lastIndex() + 1
+	}
+	n.broadcastAppend()
 }
