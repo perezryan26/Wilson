@@ -6,27 +6,33 @@ The Raft core in [`raft/`](../raft) is a deterministic state machine. It reads n
 
 ```go
 func NewNode(cfg Config, restored RestoredState) *Node
-func (n *Node) Tick()          // advance one logical clock tick
-func (n *Node) Step(m Message) // handle an inbound RPC request or response
-func (n *Node) Ready() Ready   // effects produced since the last call
-func (n *Node) Status() Status // read-only role, term, and leader
+func (n *Node) Tick()                                   // advance one logical clock tick
+func (n *Node) Step(m Message)                          // handle an inbound RPC request or response
+func (n *Node) Propose(cmd []byte) (Index, Term, error) // append a command on the leader
+func (n *Node) Ready() Ready                            // effects produced since the last call
+func (n *Node) Status() Status                          // read-only role, term, leader, commitIndex, lastApplied
 ```
 
-After every `Tick` or `Step`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
+After every `Tick`, `Step`, or `Propose`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
 
-1. **Persist.** Save `HardState`, when it is not nil, to stable storage and fsync. A storage error stops the process, because after a failed fsync the state on disk is unknown.
+1. **Persist.** Save `HardState`, when it is not nil, and `Entries` to stable storage, then fsync. When `Entries[0].Index` is at or below the last stored index, first discard every stored entry from that index on: the server is overwriting a conflicting suffix. A storage error stops the process, because after a failed fsync the state on disk is unknown.
 2. **Send.** Deliver `Messages`.
+3. **Apply.** Apply `CommittedEntries` to the state machine, in index order.
 
 | Field | Holds | Step |
 | --- | --- | --- |
 | `HardState *HardState` | `currentTerm` and `votedFor`, when either changed since the last `Ready`; nil otherwise | 1 |
+| `Entries []Entry` | Log entries not yet handed to storage, in index order | 1 |
 | `Messages []Message` | RPC requests and responses to send | 2 |
+| `CommittedEntries []Entry` | Entries committed since the last `Ready`, in index order, each released once per boot | 3 |
 
-Persisting before sending is how Figure 2's rule, that persistent state is updated on stable storage before responding to RPCs, holds for every message. The core puts a vote and the reply granting it in the same `Ready`, so the reply cannot leave before the vote is durable. Were it the other way round, a server that crashed between sending and persisting could restart, forget its vote, and vote again in the same term, and two candidates could win it.
+Persisting before sending is how Figure 2's rule, that persistent state is updated on stable storage before responding to RPCs, holds for every message. The core puts a vote and the reply granting it in the same `Ready`, and new entries and the reply acknowledging them likewise, so no reply leaves before the state it reflects is durable. Were it the other way round, a server that crashed between sending and persisting could restart, forget its vote, and vote again in the same term, and two candidates could win it; or forget entries a leader already counted toward a majority.
 
-`Ready` drains: it returns everything produced since the previous call and clears it. There is no acknowledgment call, because the runtime finishes one `Ready` before it calls the core again.
+Persisting before applying means no entry reaches the state machine before it is on this server's disk. It is also why a leader may count its own entries toward a majority before they are fsynced: the commit becomes visible, as a `LeaderCommit` in a message or an applied entry, only after the `Ready` holding those entries was persisted.
 
-This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, including the log entries to append, the committed entries to apply after sending, and the snapshots that `Ready` gains with log replication and compaction.
+`Ready` drains: it returns everything produced since the previous call and clears it. There is no acknowledgment call, because the runtime finishes one `Ready` before it calls the core again. `Entries` and `CommittedEntries`, like the entries inside messages, are copies, so nothing the core does later can change them.
+
+This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, including the snapshot that `Ready` gains with log compaction.
 
 ## Driving the core
 
@@ -40,12 +46,25 @@ for each input, a tick or an inbound message {
 	for _, m := range rd.Messages {
 		transport.Send(m)
 	}
+	for _, e := range rd.CommittedEntries {
+		stateMachine.Apply(e)
+	}
 }
 ```
 
 Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages ([TESTING.md](TESTING.md#deterministic-simulator)). The runtime in `node/` is not written yet.
 
-`NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term with that vote.
+`NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote and that log. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at 0, relearns what is committed from the leader, and applies its log again from the start.
+
+## Log replication
+
+The log (`raftLog`) holds a sentinel entry at index 0 of term 0 ahead of the real entries, so the entry before the first always exists. It is the only code that turns a log index into a slice position.
+
+- **Proposals.** `Propose` on the leader appends an entry of the current term and sends AppendEntries to every follower at once; on any other server it returns `ErrNotLeader`.
+- **Sending.** For each follower the leader keeps `nextIndex` and `matchIndex`, reset after every election. Every AppendEntries carries all the entries from the follower's `nextIndex` on, so a heartbeat also retries whatever a lost message failed to deliver.
+- **Receiving.** The follower checks the entry at `PrevLogIndex`, keeps the entries it already holds, truncates only at a real conflict, appends the rest, and raises `commitIndex` to `min(LeaderCommit, the request's last entry)`. A stale or repeated request truncates nothing.
+- **Replies.** A success names what it acknowledges, `MatchIndex = PrevLogIndex + len(Entries)`, because replies arrive late, twice, or out of order. `matchIndex` only moves forward. A rejection names where the logs part, and the leader skips a whole conflicting term per round trip ([ADR-0004](adr/0004-fast-log-backtracking.md)).
+- **Commitment.** The leader commits the highest index a majority stores, counting its own log, but only if that entry is from its current term (§5.4.2, Figure 8); earlier entries then commit with it.
 
 ## Time
 
@@ -87,6 +106,7 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | File | Contents |
 | --- | --- |
 | [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `HardState`, `Message` and the RPC structs, `Ready` |
-| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Ready`, `Status`, and the three `become*` functions |
+| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Ready`, `Status`, and the three `become*` functions |
+| [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, and the merge that carries out AppendEntries steps 3 and 4 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
-| [`append_entries.go`](../raft/append_entries.go) | Heartbeats and the AppendEntries receiver |
+| [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, the leader's handling of replies, fast backtracking, and the commit rule |

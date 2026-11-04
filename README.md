@@ -2,13 +2,13 @@
 
 A linearizable key-value store built on the Raft consensus algorithm, written in Go from scratch and meant to be read beside the [extended Raft paper](https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf).
 
-> **Status: leader election.** The Raft core elects a leader and replaces one that fails, shown by unit tests, a three-node test harness, and a deterministic simulator that injects partitions, crashes, and message faults. Log replication, durable storage, the runtime, and the key-value service are not written yet. Each section below says what exists today.
+> **Status: log replication.** The Raft core elects leaders and replicates a log, so committed commands are applied in the same order on every server. Unit tests, scripted scenarios from the paper's Figures 7 and 8, and a deterministic simulator that injects partitions, crashes, and message faults show it. Durable storage, snapshots, the runtime, and the key-value service are not written yet. Each section below says what exists today.
 
 ## Overview and guarantees
 
 Wilson is a replicated key-value store that keeps serving Get, Put, and Delete while a majority of its servers are up. It implements §5–§8 of the paper by Ongaro and Ousterhout: leader election, log replication, safety, membership changes, log compaction, and client interaction. The code is written to be read and maintained by people, with the paper open beside it.
 
-The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far only Election Safety has evidence: unit tests, a three-node harness, and the deterministic simulator, which checks it after every event under thousands of randomized fault schedules (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
+The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far the five Figure 3 properties have evidence: the deterministic simulator checks each after every event under thousands of randomized fault schedules, beside unit tests and scenarios from the paper (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
 
 | Guarantee | Meaning | Verified by |
 | --- | --- | --- |
@@ -66,14 +66,14 @@ Only `node/` touches time, disk, and the network. The simulator and the MIT 6.58
 
 Every package below exists with its package documentation. Only `raft/`, `internal/storage/`, and `internal/sim/` have code so far.
 
-- **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs. So far it implements leader election: the three roles, the randomized election timer, RequestVote, and heartbeats. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes its contract with the runtime.
+- **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs. So far it implements leader election and log replication: the three roles, the randomized election timer, RequestVote, proposals, AppendEntries with the consistency check and fast backtracking, and the commit rule. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes its contract with the runtime.
 - **`node/`** is the runtime. One goroutine feeds the core ticks, inbound messages, and proposals, then handles each `Ready` in order: persist and fsync, send, apply. A storage error stops the process.
-- **`internal/storage/`** persists hard state, log entries, and snapshots. It holds an in-memory implementation for tests and a file implementation built on a segmented write-ahead log. So far only the in-memory implementation exists, and it keeps hard state.
+- **`internal/storage/`** persists hard state, log entries, and snapshots. It holds an in-memory implementation for tests and a file implementation built on a segmented write-ahead log. So far only the in-memory implementation exists, and it keeps hard state and the log.
 - **`internal/transport/`** carries Raft messages between nodes as JSON over HTTP/1.1 ([ADR-0002](docs/adr/0002-http-json-transport.md)).
 - **`internal/kv/`** is the replicated state machine: the command encoding, Get, Put, and Delete, and the per-client session table that makes retried writes apply once.
 - **`internal/kvserver/`** is the client-facing HTTP API. It proposes commands, waits for them to apply, and points clients at the leader.
 - **`client/`** is the Go client library: leader discovery, retries, client IDs, and sequence numbers.
-- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event. So far it checks Election Safety, that terms never fall, and one vote per term, plus liveness once faults heal.
+- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event. So far it checks the five Figure 3 properties, that terms never fall, one vote per term, and the order entries are applied in, plus liveness once faults heal.
 - **`internal/linearizability/`** holds the Porcupine model and the history recorder.
 - **`cmd/kvnode/`** and **`cmd/kvctl/`** are the server and CLI binaries.
 - **`test/chaos/`** is the multi-process chaos test.
@@ -82,20 +82,30 @@ Every package below exists with its package documentation. Only `raft/`, `intern
 
 ## Paper-to-code map
 
-Each row names a concept or rule from the paper, the function that implements it, and the tests that cover it. The rows cover leader election: §5.1, §5.2, and the election rules of Figure 2. Every test named here is in `raft/`, except those marked (sim), which are in `internal/sim/`.
+Each row names a concept or rule from the paper, the code that implements it, and the tests that cover it. The rows cover §5.1–§5.5, every rule of Figure 2, and the Figure 3 properties. Every test named here is in `raft/`, except those marked (sim), which are in `internal/sim/`.
 
 | Paper | Rule | Code | Tests |
 | --- | --- | --- | --- |
-| Figure 2, State | `currentTerm` and `votedFor` reach stable storage before the server responds to an RPC | [`Node.Ready`](raft/node.go) puts a vote and the reply granting it in one `Ready`, which the runtime persists before it sends ([ARCHITECTURE.md](docs/ARCHITECTURE.md#the-ready-contract)) | `TestVoteIsDurableBeforeReply` |
-| Figure 2, State | `currentTerm` starts at 0 and only increases; `votedFor` is null until the server votes in the current term | [`becomeFollower`, `becomeCandidate`](raft/node.go) | `TestRequestVoteRejectsStaleTerm`, `TestHigherTermInRequestStepsDown` |
+| Figure 2, State | `currentTerm`, `votedFor`, and `log[]` reach stable storage before the server responds to an RPC | [`Node.Ready`](raft/node.go): a vote or new entries leave in the same `Ready` as the reply that depends on them, and the runtime persists before it sends ([ARCHITECTURE.md](docs/ARCHITECTURE.md#the-ready-contract)) | `TestVoteIsDurableBeforeReply`, `TestAppendEntriesReplacesConflictingEntries` |
+| Figure 2, State | `currentTerm` starts at 0 and only increases; `votedFor` is null until the server votes in the current term | [`becomeFollower`, `becomeCandidate`](raft/node.go) | `TestRequestVoteRejectsStaleTerm`, `TestHigherTermInRequestStepsDown`, `TestRandomized` (sim) |
+| Figure 2, State | `log[]`: entries from index 1, each with a command and the term the leader received it in | [`raftLog`](raft/log.go), behind a sentinel at index 0 | `TestLogSentinel`, `TestNewLogRejectsGaps` |
+| Figure 2, State | `commitIndex` and `lastApplied` start at 0, only increase, and are volatile | [`commitTo`](raft/append_entries.go), [`Node.Ready`](raft/node.go) | `TestFollowerAdvancesCommitIndex`, `TestFollowerReleasesCommittedEntries` |
+| Figure 2, State | After each election, `nextIndex[]` starts just past the leader's last entry and `matchIndex[]` at 0; `matchIndex` only increases | [`becomeLeader`](raft/node.go), [`handleAppendEntriesResponse`](raft/append_entries.go) | `TestLeaderSendsEntriesFromNextIndex`, `TestMatchIndexOnlyMovesForward` |
 | §5.2 | Servers start up as followers, from the state they persisted | [`NewNode`](raft/node.go) | `TestNewNodeRestoresHardState`, `TestClusterReplacesFailedLeader` |
-| Figure 2, RequestVote arguments | `term`, `candidateId`, `lastLogIndex`, `lastLogTerm` | [`RequestVoteRequest`](raft/types.go), sent by [`campaign`](raft/election.go) | `TestFollowerTimeoutStartsElection` |
+| Figure 2, AppendEntries arguments | `term`, `leaderId`, `prevLogIndex`, `prevLogTerm`, `entries[]`, `leaderCommit` | [`AppendEntriesRequest`](raft/types.go), sent by [`sendAppend`](raft/append_entries.go) | `TestLeaderSendsEntriesFromNextIndex` |
+| Figure 2, AppendEntries results | `term` and `success`, plus `MatchIndex`, `ConflictTerm`, and `ConflictIndex` ([ADR-0004](docs/adr/0004-fast-log-backtracking.md)) | [`AppendEntriesResponse`](raft/types.go) | `TestAppendEntriesReplacesConflictingEntries`, `TestRejectionNamesConflict` |
+| Figure 2, AppendEntries receiver, step 1 | Reply false if `term < currentTerm` (§5.1) | [`handleAppendEntries`](raft/append_entries.go) | `TestAppendEntriesRejectsStaleTerm` |
+| Figure 2, AppendEntries receiver, step 2 | Reply false if the log has no entry at `prevLogIndex` whose term matches `prevLogTerm` (§5.3) | [`handleAppendEntries`](raft/append_entries.go) | `TestAppendEntriesChecksPrevEntry` |
+| Figure 2, AppendEntries receiver, step 3 | If an existing entry conflicts with a new one, delete it and all that follow it (§5.3) | [`raftLog.merge`](raft/log.go) | `TestAppendEntriesReplacesConflictingEntries`, `TestStaleAppendEntriesDoesNotTruncate` |
+| Figure 2, AppendEntries receiver, step 4 | Append any new entries not already in the log | [`raftLog.merge`](raft/log.go) | `TestAppendEntriesAppendsOnlyNewEntries`, `TestDuplicateAppendEntriesIsIdempotent` |
+| Figure 2, AppendEntries receiver, step 5 | If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)` | [`handleAppendEntries`](raft/append_entries.go) | `TestFollowerAdvancesCommitIndex` |
+| Figure 2, RequestVote arguments | `term`, `candidateId`, `lastLogIndex`, `lastLogTerm` | [`RequestVoteRequest`](raft/types.go), sent by [`requestVotes`](raft/election.go) | `TestFollowerTimeoutStartsElection` |
+| Figure 2, RequestVote results | `term`, `voteGranted` | [`RequestVoteResponse`](raft/types.go), sent by [`replyVote`](raft/election.go) | `TestOneVotePerTerm` |
 | Figure 2, RequestVote receiver, step 1 | Reply false if `term < currentTerm` (§5.1) | [`handleRequestVote`](raft/election.go) | `TestRequestVoteRejectsStaleTerm` |
 | Figure 2, RequestVote receiver, step 2 | Grant the vote only if `votedFor` is null or `candidateId`: one vote per term, first come, first served (§5.2) | [`handleRequestVote`](raft/election.go) | `TestOneVotePerTerm`, `TestNewNodeRestoresHardState` |
-| Figure 2, RequestVote receiver, step 2; §5.4.1 | ... and only if the candidate's log is at least as up-to-date as the receiver's | [`isUpToDate`](raft/election.go) | `TestVoteRequiresUpToDateLog` |
-| Figure 2, AppendEntries arguments | `term` and `leaderId`; the log fields arrive with log replication (§5.3) | [`AppendEntriesRequest`](raft/types.go) | `TestLeaderSendsHeartbeats` |
-| Figure 2, AppendEntries receiver, step 1 | Reply false if `term < currentTerm` (§5.1) | [`handleAppendEntries`](raft/append_entries.go) | `TestAppendEntriesRejectsStaleTerm` |
-| Figure 2, Rules for Servers, all servers | A request or response with term T > `currentTerm`: set `currentTerm` = T and convert to follower (§5.1) | [`Node.Step`](raft/node.go), before any handler | `TestHigherTermInRequestStepsDown`, `TestHigherTermInResponseStepsDown` |
+| Figure 2, RequestVote receiver, step 2; §5.4.1 | ... and only if the candidate's log is at least as up-to-date as the receiver's | [`isUpToDate`](raft/election.go) | `TestVoteRequiresUpToDateLog`, `TestStaleLogCandidateLoses` |
+| Figure 2, all servers | If `commitIndex > lastApplied`, apply the next entry to the state machine (§5.3) | [`Node.Ready`](raft/node.go) releases `CommittedEntries` in index order, after the same `Ready`'s entries are persisted | `TestCommittedEntriesComeOutOnceInOrder`, `TestFollowerReleasesCommittedEntries` |
+| Figure 2, all servers | A request or response with term T > `currentTerm`: set `currentTerm` = T and convert to follower (§5.1) | [`Node.Step`](raft/node.go), before any handler | `TestHigherTermInRequestStepsDown`, `TestHigherTermInResponseStepsDown` |
 | Figure 2, followers | Respond to RPCs from candidates and leaders | [`handleRequestVote`](raft/election.go), [`handleAppendEntries`](raft/append_entries.go) | `TestOneVotePerTerm`, `TestHeartbeatsSuppressElection` |
 | Figure 2, followers | If the election timeout elapses without an AppendEntries from the current leader or a vote granted, convert to candidate | [`Node.Tick`](raft/node.go); the timer restarts only in [`handleAppendEntries`](raft/append_entries.go) and on a grant in [`handleRequestVote`](raft/election.go) | `TestFollowerTimeoutStartsElection`, `TestHeartbeatsSuppressElection`, `TestElectionTimerReset` |
 | Figure 2, candidates | On conversion, start an election: increment `currentTerm`, vote for self, reset the election timer, send RequestVote to all other servers | [`becomeCandidate`](raft/node.go), [`campaign`, `requestVotes`](raft/election.go) | `TestFollowerTimeoutStartsElection` |
@@ -103,12 +113,23 @@ Each row names a concept or rule from the paper, the function that implements it
 | Figure 2, candidates | Votes from a majority of servers: become leader | [`handleRequestVoteResponse`, `hasMajority`](raft/election.go) | `TestCandidateWinsWithMajority`, `TestDuplicateVoteResponseCountsOnce`, `TestSingleServerElectsItself` |
 | Figure 2, candidates; §5.2 | AppendEntries from the new leader: convert to follower | [`handleAppendEntries`](raft/append_entries.go) | `TestCandidateStepsDownOnAppendEntriesFromLeader`, `TestAppendEntriesRejectsStaleTerm` |
 | Figure 2, candidates | If the election timeout elapses, start a new election | [`Node.Tick`](raft/node.go), [`campaign`](raft/election.go) | `TestSplitVoteStartsNewElection` |
-| Figure 2, leaders | Upon election, send an empty AppendEntries (heartbeat) to each server; repeat during idle periods to prevent election timeouts | [`becomeLeader`](raft/node.go), [`broadcastHeartbeat`](raft/append_entries.go) | `TestLeaderSendsHeartbeats`, `TestHeartbeatsSuppressElection` |
+| Figure 2, leaders | Upon election, send an empty AppendEntries (heartbeat) to each server; repeat during idle periods to prevent election timeouts | [`becomeLeader`](raft/node.go), [`broadcastAppend`](raft/append_entries.go) | `TestLeaderSendsHeartbeats`, `TestHeartbeatsSuppressElection` |
+| Figure 2, leaders | If a command is received from a client, append an entry to the local log; respond after the entry is applied (§5.3) | [`Node.Propose`](raft/node.go) appends and returns the entry's index and term; answering the client once that entry comes back through `CommittedEntries` belongs to the runtime and key-value service, not written yet | `TestProposeAppendsOnLeader`, `TestProposeRefusedOffLeader` |
+| Figure 2, leaders | If last log index ≥ `nextIndex` for a follower, send AppendEntries with the entries starting at `nextIndex` | [`sendAppend`](raft/append_entries.go): every AppendEntries carries them, heartbeats included, so each heartbeat also retries | `TestLeaderSendsEntriesFromNextIndex`, `TestLeaderSendsRestToLaggingFollower` |
+| Figure 2, leaders | If successful, update `nextIndex` and `matchIndex` for the follower (§5.3) | [`handleAppendEntriesResponse`](raft/append_entries.go), from the reply's `MatchIndex` | `TestMatchIndexOnlyMovesForward`, `TestLeaderSendsRestToLaggingFollower` |
+| Figure 2, leaders; §5.3 | If AppendEntries fails because of log inconsistency, back up `nextIndex` and retry, skipping a whole conflicting term per round trip | [`handleAppendEntriesResponse`, `backtrack`](raft/append_entries.go) ([ADR-0004](docs/adr/0004-fast-log-backtracking.md)) | `TestLeaderSkipsConflictingTerm`, `TestDivergentLogConvergesPerTerm`, `TestFigure7FollowersConverge` |
+| Figure 2, leaders | If some N > `commitIndex` has a majority of `matchIndex[i] ≥ N` and `log[N].term == currentTerm`, set `commitIndex = N` (§5.3, §5.4) | [`maybeCommit`](raft/append_entries.go), counting the leader's own log | `TestLeaderCommitsOnMajority`, `TestSingleServerCommitsItsProposals`, `TestFigure8OldTermEntryNotCommittedByCounting` |
 | §5.2 | Election timeouts are chosen at random from a fixed interval, [T, 2T), again for every election | [`resetElectionTimer`](raft/election.go) | `TestElectionTimeoutInRange` |
 | §5.2; Figure 3, Election Safety | At most one leader per term, because each server votes once per term and a winner needs a majority | [`hasMajority`](raft/election.go); a leader that meets a rival of its term panics in [`handleAppendEntries`](raft/append_entries.go) | `TestClusterElectsOneLeader`, `TestTwoLeadersInOneTermPanics`, `TestRandomized` (sim) |
 | §5.2 | A minority partition never elects a leader, however high its terms climb | [`hasMajority`](raft/election.go) | `TestMinorityPartitionNeverElects` (sim) |
 | §5.2 | When the leader fails, the remaining majority elects a new one in a later term | The rules above, together | `TestClusterReplacesFailedLeader`, `TestCrashedLeaderIsReplaced` (sim) |
 | §5.1, §5.2 | A leader cut off from the majority is replaced in a later term, and steps down when it hears that term | The rules above, together | `TestIsolatedLeaderIsReplaced` (sim) |
+| §5.3; Figure 3, Leader Append-Only | A leader never overwrites or deletes entries in its log | [`Node.Propose`](raft/node.go) only appends, and a leader never runs `merge` | `TestRandomized` (sim) |
+| §5.3; Figure 3, Log Matching | Two logs with an entry of the same index and term hold the same command there and are identical up to it | The consistency check in [`handleAppendEntries`](raft/append_entries.go) | `TestFigure7FollowersConverge`, `TestRandomized` (sim) |
+| §5.4.1; Figure 3, Leader Completeness | An entry committed in a term is in the log of every leader of a later term | [`isUpToDate`](raft/election.go) | `TestStaleLogCandidateLoses`, `TestRandomized` (sim) |
+| §5.4.2 | A leader never commits an entry from an earlier term by counting replicas; it commits with the first entry of its own term | [`maybeCommit`](raft/append_entries.go) | `TestFigure8OldTermEntryNotCommittedByCounting` |
+| §5.4.3; Figure 3, State Machine Safety | No two servers apply different entries at one index | The rules above, together | `TestRandomized` (sim) |
+| §5.5 | RPCs are idempotent: a repeated AppendEntries changes nothing | [`raftLog.merge`](raft/log.go) | `TestDuplicateAppendEntriesIsIdempotent`, `TestStaleAppendEntriesDoesNotTruncate` |
 
 ## Verification
 
@@ -117,7 +138,7 @@ Six independent harnesses produce the evidence for correctness, and no single on
 | Harness | What it catches | How to run | State |
 | --- | --- | --- | --- |
 | Race detector | Data races in the runtime, transport, kvserver, and client | `make test` | Runs every test; the code so far is single-threaded |
-| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Checks Election Safety, terms, and votes after every event, and liveness after faults heal |
+| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Checks the five Figure 3 properties, terms, votes, and applied order after every event, and liveness after faults heal |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | Private adapter | Not built |
 | Porcupine | Client histories that are not linearizable | Inside the simulator and chaos tests | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | `make fuzz FUZZTIME=60s` | Wired; no targets yet |
@@ -186,3 +207,4 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | `phase-0` | 2026-10-27 | Module and package layout, Makefile, lint configuration, CI, contributing and testing guides, ADR-0001 (deterministic core) and ADR-0002 (HTTP/JSON transport) |
 | `phase-1` | 2026-10-27 | Core types and leader election: the three roles, the randomized election timer, RequestVote, heartbeats, in-memory storage, a three-node election harness, and `docs/ARCHITECTURE.md` |
 | `phase-2` | 2026-11-03 | The deterministic simulator: a virtual clock, a seeded event queue, message loss, duplication, and delay, partitions, crashes, restarts, invariant checks after every event, liveness after healing, traces, seed replay, and a nightly 50,000-seed sweep; candidates re-send unanswered RequestVotes |
+| `phase-3` | 2026-11-03 | Log replication and commitment: the log, proposals, AppendEntries with the consistency check and fast backtracking (ADR-0004), the commit rule, committed entries through `Ready`, Figures 7 and 8 as tests, and simulator checks for all five Figure 3 properties |

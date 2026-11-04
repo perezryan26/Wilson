@@ -9,7 +9,7 @@ Six independent harnesses produce the evidence for Wilson's correctness, and no 
 | Harness | What it catches | When it runs | State |
 | --- | --- | --- | --- |
 | Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Runs every test; the code so far is single-threaded |
-| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks Election Safety, terms, and votes after every event, and liveness after faults heal |
+| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks the five Figure 3 properties, terms, votes, and applied order after every event, and liveness after faults heal |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | 20 consecutive passing runs | Not built |
 | Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target nightly and before each phase tag | Wired; no targets yet |
@@ -21,7 +21,8 @@ A nightly workflow ([nightly.yml](../.github/workflows/nightly.yml)) runs `make 
 
 These test the core directly. Both live in `raft/` and run with every `make test`; the simulator below then tests the same rules under faults.
 
-- **Unit tests** drive one core with `Tick` and `Step` and check the `Ready` and `Status` it returns, with no sleeps. Each is named after the rule it covers, and the README's [paper-to-code map](../README.md#paper-to-code-map) lists which test covers which rule of Figure 2.
+- **Unit tests** drive one core with `Tick`, `Step`, and `Propose` and check the `Ready` and `Status` it returns, with no sleeps. Each is named after the rule it covers, and the README's [paper-to-code map](../README.md#paper-to-code-map) lists which test covers which rule of Figure 2.
+- **Scenarios from the paper** pass messages between a few cores by hand. `TestFigure7FollowersConverge` brings each of Figure 7's six follower logs into line with the leader's and counts the rejections it takes. `TestFigure8OldTermEntryNotCommittedByCounting` plays Figure 8's (c), (d), and (e) on five cores.
 - **The three-node harness** ([`raft/cluster_test.go`](../raft/cluster_test.go)) runs whole elections in one goroutine. Each round ticks every running server once, then delivers messages in the order they were sent until none are left. Every server's `Ready` is handled as a runtime handles it: hard state saved to in-memory storage, then messages sent. A crashed server loses all but its storage and the messages sent to it while it is down; a restarted one boots from that storage. After every `Ready` the harness checks Election Safety: no two servers ever lead the same term.
 
 `TestClusterElectsOneLeader` and `TestClusterReplacesFailedLeader` each run 1,000 seeds. A seed fixes every server's random source, so a failure names its seed and repeats on every run. Run them alone with:
@@ -38,17 +39,24 @@ go test ./raft -run TestCluster
 
 [`internal/sim`](../internal/sim) runs a whole cluster in one goroutine on a virtual clock. One random source, seeded by the run's seed, makes every choice: each server's clock skew (up to 20% fast or slow), each message's delay, loss, and duplication, every fault, and each server core's own random source for election timeouts. The simulator uses only integer arithmetic, so a seed replays byte for byte on any machine; traces match on arm64 and amd64.
 
-Each server handles every `Ready` as a runtime does: it saves the hard state, then sends the messages. Crashes happen between events, so a crash never interrupts a `Ready`, and storage keeps everything saved. After every event, the simulator checks:
+Each server handles every `Ready` as a runtime does: it saves the hard state and entries, sends the messages, then applies the committed entries. Crashes happen between events, so a crash never interrupts a `Ready`, and storage keeps everything saved. After every event, the simulator checks the five properties of Figure 3 and more:
 
-- **Election Safety** (Figure 3): no two servers ever lead the same term, over the whole run.
+- **Election Safety:** no two servers ever lead the same term, over the whole run.
+- **Leader Append-Only:** a leader never writes at or below its last stored index.
+- **Log Matching:** every stored copy of an entry agrees on its command and on the term of the entry before it, which by induction makes two logs sharing an entry identical up to it.
+- **Leader Completeness:** every new leader, and every leader when an entry newly commits, holds each entry committed in an earlier term.
+- **State Machine Safety:** no two servers ever apply different entries at one index.
 - **Terms never fall:** a server's `currentTerm` never decreases, even across a restart.
 - **One vote per term:** no server saves a vote for a second candidate in a term, even after a restart.
+- **Applied order:** each server keeps `lastApplied ≤ commitIndex ≤` its last index, and applies entries one by one from index 1 after every boot.
 
 The first violation ends the run.
 
 ### The randomized schedule
 
-`TestRandomized` runs seeds 0 to N−1 in parallel. Seed s runs a cluster of 1 + (s mod 5) servers for ten seconds of virtual time and injects a fault every 50 ms to 1 s: a partition into two or three groups, a heal, a one-way cut, a crash, a restart, or new network conditions (up to 50% loss, 20% duplication, and 400 ms delay). Then every fault heals: all links return, the network goes back to 1–10 ms with no loss, and crashed servers restart. Within ten more seconds, the servers must agree on a leader, which is the liveness check.
+`TestRandomized` runs seeds 0 to N−1 in parallel. Seed s runs a cluster of 1 + (s mod 5) servers for ten seconds of virtual time and injects a fault every 50 ms to 1 s: a partition into two or three groups, a heal, a one-way cut, a crash, a restart, or new network conditions (up to 50% loss, 20% duplication, and 400 ms delay). Meanwhile a client proposes a new command every 10 to 200 ms to a server that believes it leads, stale leaders included. Then every fault heals: all links return, the network goes back to 1–10 ms with no loss, and crashed servers restart. The liveness check follows: within ten seconds the servers must agree on a leader, and within ten more apply a command proposed to it, which commits every entry before it in the leader's log.
+
+Some bugs need rare interleavings. A commit rule that counted replicas of earlier-term entries, the hazard of Figure 8, failed only 3 of 50,000 seeds; the nightly sweep is there for bugs like it, and Figure 8 also has its own scripted test.
 
 | Run | Seeds |
 | --- | --- |
@@ -76,7 +84,8 @@ t=1636.130ms n2 leader→follower term=1→2 leader=n2→none
 
 - `t=` is virtual time since the run began, in milliseconds to the microsecond.
 - `boot` starts a server from its storage, showing the term and vote it restored and its skewed tick interval. `crash` stops a server.
-- A server's own line shows its role, term, and leader after an event, with `old→new` for each one that changed.
+- A server's own line shows its role, term, and leader after an event, with `old→new` for each one that changed, and `commitIndex` and `lastApplied` when they moved.
+- `propose` shows a client's command reaching a server: the index and term of the new entry, or why it was refused.
 - `partition` (groups separated by `|`), `cut`, `heal`, and `network` are faults.
 - A final `FAILED:` line names the violation, or the liveness check that timed out.
 
@@ -86,11 +95,11 @@ t=1636.130ms n2 leader→follower term=1→2 leader=n2→none
 go test ./internal/sim -run TestRandomized -seed=N -v
 ```
 
-This reruns seed N alone and logs its trace with every message added. A delivery shows as `n2→n3 RequestVote term=4 candidateId=2 lastLogIndex=0 lastLogTerm=0`, with the paper's field names. A message the network loses or copies as it is sent is marked `lost` or `duplicated`; one stopped on arrival by a partition or a crashed receiver is marked `cut` or `down`.
+This reruns seed N alone and logs its trace with every message added. A delivery shows as `n2→n3 RequestVote term=4 candidateId=2 lastLogIndex=0 lastLogTerm=0`, or `n3→n1 AppendEntries term=1 leaderId=3 prevLogIndex=0 prevLogTerm=0 entries=[1@1] leaderCommit=0` with entries as index@term, using the paper's field names. A message the network loses or copies as it is sent is marked `lost` or `duplicated`; one stopped on arrival by a partition or a crashed receiver is marked `cut` or `down`.
 
 ### Scripted scenarios
 
-`sim.New` builds a cluster for a scripted test. `RunFor`, `RunUntil`, `Partition`, `Cut`, `Heal`, `Crash`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples.
+`sim.New` builds a cluster for a scripted test. `RunFor`, `RunUntil`, `Propose`, `Partition`, `Cut`, `Heal`, `Crash`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples.
 
 ## MIT 6.5840 test suites
 
