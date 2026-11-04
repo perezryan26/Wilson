@@ -23,6 +23,37 @@ func DefaultNetwork() Network {
 // SetNetwork changes how the messages sent from now on travel.
 func (c *Cluster) SetNetwork(n Network) { c.net = n }
 
+// link is the one-way path from one server to another.
+type link struct{ from, to raft.NodeID }
+
+// Partition splits the cluster into groups: a server can then reach only
+// the servers in its own group, and a server named in no group can reach
+// no one. It replaces any earlier partition or cut. A message already in
+// flight across a new boundary is lost when it arrives.
+func (c *Cluster) Partition(groups ...[]raft.NodeID) {
+	group := map[raft.NodeID]int{}
+	for i, g := range groups {
+		for _, id := range g {
+			group[id] = i + 1
+		}
+	}
+	c.blocked = map[link]bool{}
+	for _, a := range c.ids() {
+		for _, b := range c.ids() {
+			if a != b && (group[a] == 0 || group[a] != group[b]) {
+				c.blocked[link{a, b}] = true
+			}
+		}
+	}
+}
+
+// Cut blocks messages from one server to another but not the reverse, as a
+// one-way network failure does.
+func (c *Cluster) Cut(from, to raft.NodeID) { c.blocked[link{from, to}] = true }
+
+// Heal restores every link that a partition or a cut blocked.
+func (c *Cluster) Heal() { c.blocked = map[link]bool{} }
+
 // send puts m in flight: it may be lost or duplicated, and each copy
 // arrives after its own random delay.
 func (c *Cluster) send(m raft.Message) {
@@ -39,11 +70,11 @@ func (c *Cluster) send(m raft.Message) {
 	}
 }
 
-// deliver hands m to its receiver, unless the receiver is down, and carries
-// out the receiver's Ready.
+// deliver hands m to its receiver, unless the receiver is down or the link
+// is blocked, and carries out the receiver's Ready.
 func (c *Cluster) deliver(m raft.Message) {
 	n := c.node(m.To)
-	if n.core == nil {
+	if n.core == nil || c.blocked[link{m.From, m.To}] {
 		return
 	}
 	n.core.Step(m)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/perezryan26/wilson/internal/storage"
@@ -30,8 +31,9 @@ type Cluster struct {
 	queue queue
 	seq   uint64 // events scheduled so far
 
-	nodes []*node // nodes[i] is server i+1
-	net   Network
+	nodes   []*node // nodes[i] is server i+1
+	net     Network
+	blocked map[link]bool // links cut by a partition or a cut
 
 	leaders map[raft.Term]raft.NodeID // every leader seen, by term
 	err     error                     // the first violation, which ends the run
@@ -56,6 +58,7 @@ func New(opts Options) *Cluster {
 	c := &Cluster{
 		rng:     rand.New(rand.NewPCG(opts.Seed, 0)),
 		net:     DefaultNetwork(),
+		blocked: map[link]bool{},
 		leaders: map[raft.Term]raft.NodeID{},
 	}
 	_, tick := raft.DefaultConfig()
@@ -74,6 +77,17 @@ func New(opts Options) *Cluster {
 	return c
 }
 
+// Crash stops server id. It loses everything but its storage, and messages
+// that arrive while it is down are lost.
+func (c *Cluster) Crash(id raft.NodeID) { c.node(id).core = nil }
+
+// Restart boots server id from its storage, if it is down.
+func (c *Cluster) Restart(id raft.NodeID) {
+	if n := c.node(id); n.core == nil {
+		c.boot(n)
+	}
+}
+
 // Now returns the virtual time since the cluster started.
 func (c *Cluster) Now() time.Duration { return c.now }
 
@@ -89,13 +103,17 @@ func (c *Cluster) Status(id raft.NodeID) (raft.Status, bool) {
 // Leaders returns every leader seen so far, by term.
 func (c *Cluster) Leaders() map[raft.Term]raft.NodeID { return maps.Clone(c.leaders) }
 
-// AgreedLeader returns the leader that every running server among ids
-// follows in one shared term, and that term, provided the leader is up and
-// leading it. Otherwise it returns None. With no ids, it asks every server.
+// AgreedLeader returns the server among ids that every running server among
+// ids follows in one shared term, and that term, provided it is up and
+// leading that term. Otherwise it returns None. With no ids, it asks every
+// server.
 func (c *Cluster) AgreedLeader(ids ...raft.NodeID) (raft.NodeID, raft.Term) {
+	if len(ids) == 0 {
+		ids = c.ids()
+	}
 	lead, term := c.commonLeader(ids)
 	st, up := c.Status(lead)
-	if !up || st.Role != raft.Leader || st.Term != term {
+	if !up || st.Role != raft.Leader || st.Term != term || !slices.Contains(ids, lead) {
 		return raft.None, 0
 	}
 	return lead, term
@@ -104,9 +122,6 @@ func (c *Cluster) AgreedLeader(ids ...raft.NodeID) (raft.NodeID, raft.Term) {
 // commonLeader returns the leader and term that every running server among
 // ids names, or None if they name different ones or none.
 func (c *Cluster) commonLeader(ids []raft.NodeID) (raft.NodeID, raft.Term) {
-	if len(ids) == 0 {
-		ids = c.ids()
-	}
 	var lead raft.NodeID
 	var term raft.Term
 	for _, id := range ids {
