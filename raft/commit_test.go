@@ -111,3 +111,40 @@ func TestFigure8OldTermEntryNotCommittedByCounting(t *testing.T) {
 		}
 	})
 }
+
+// Figure 2, all servers: committed entries are applied in index order. A
+// Ready releases each committed entry once, after the Entries and Messages
+// of the same Ready, which the runtime persists and sends first.
+func TestCommittedEntriesComeOutOnceInOrder(t *testing.T) {
+	n := newTestNode(1, 1, 1)
+	tickUntilElection(t, n)
+	n.Ready()
+	for i, cmd := range []string{"x", "y"} {
+		if _, _, err := n.Propose([]byte(cmd)); err != nil {
+			t.Fatal(err)
+		}
+		rd := n.Ready()
+		want := []Entry{{Index: Index(i + 1), Term: 1, Data: []byte(cmd)}}
+		wantEntries(t, "Ready entries", rd.Entries, want)
+		wantEntries(t, "Ready committed entries", rd.CommittedEntries, want)
+	}
+	if st := n.Status(); st.CommitIndex != 2 || st.LastApplied != 2 {
+		t.Errorf("status = %+v, want commitIndex and lastApplied 2", st)
+	}
+}
+
+// A follower that learns of commits releases every newly committed entry in
+// index order, including ones the same request appended. commitIndex and
+// lastApplied are volatile: a restarted server starts both at 0 and applies
+// its log again as it relearns what is committed.
+func TestFollowerReleasesCommittedEntries(t *testing.T) {
+	n := newFollower(1, 1, 1)
+	if st := n.Status(); st.CommitIndex != 0 || st.LastApplied != 0 {
+		t.Fatalf("restarted status = %+v, want commitIndex and lastApplied 0", st)
+	}
+	n.Step(appendFrom(1, 2, 1, entriesAt(3, 1), 3))
+	wantEntries(t, "Ready committed entries", n.Ready().CommittedEntries, logOf(1, 1, 1))
+	if st := n.Status(); st.LastApplied != 3 {
+		t.Errorf("lastApplied = %d, want 3", st.LastApplied)
+	}
+}

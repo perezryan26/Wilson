@@ -101,6 +101,7 @@ type Status struct {
 	Term        Term   // currentTerm
 	Leader      NodeID // the leader of Term as far as this node knows, or None
 	CommitIndex Index  // highest log index known to be committed
+	LastApplied Index  // highest log index released through Ready to be applied
 }
 
 // Node is one Raft server as a deterministic state machine: it reads no
@@ -119,7 +120,10 @@ type Node struct {
 	votedFor    NodeID
 	log         raftLog
 
-	commitIndex Index // volatile, as in Figure 2: a restarted server relearns it
+	// Volatile, as in Figure 2: a restarted server relearns commitIndex
+	// from the leader and applies its log again from the start.
+	commitIndex Index
+	lastApplied Index
 
 	// Volatile state on leaders, reinitialized after each election.
 	nextIndex  map[NodeID]Index // the next log index to send each server
@@ -232,6 +236,10 @@ func (n *Node) Ready() Ready {
 		rd.Entries = n.log.from(n.unstable)
 		n.unstable = n.log.lastIndex() + 1
 	}
+	if n.lastApplied < n.commitIndex {
+		rd.CommittedEntries = n.log.between(n.lastApplied+1, n.commitIndex)
+		n.lastApplied = n.commitIndex
+	}
 	if hs := (HardState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor}); hs != n.prevHardState {
 		rd.HardState = &hs
 		n.prevHardState = hs
@@ -241,7 +249,13 @@ func (n *Node) Ready() Ready {
 
 // Status returns the node's role, term, and leader.
 func (n *Node) Status() Status {
-	return Status{Role: n.role, Term: n.currentTerm, Leader: n.leader, CommitIndex: n.commitIndex}
+	return Status{
+		Role:        n.role,
+		Term:        n.currentTerm,
+		Leader:      n.leader,
+		CommitIndex: n.commitIndex,
+		LastApplied: n.lastApplied,
+	}
 }
 
 // send queues m for the next Ready.

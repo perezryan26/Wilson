@@ -38,6 +38,13 @@ func (l *raftLog) append(e Entry) { l.entries = append(l.entries, e) }
 // out in a message or a Ready.
 func (l *raftLog) from(i Index) []Entry { return slices.Clone(l.entries[i-l.entries[0].Index:]) }
 
+// between returns a copy of the entries from index lo to index hi, both
+// included.
+func (l *raftLog) between(lo, hi Index) []Entry {
+	off := l.entries[0].Index
+	return slices.Clone(l.entries[lo-off : hi-off+1])
+}
+
 // merge carries out AppendEntries receiver steps 3 and 4 for entries, which
 // follow an entry the log already matches. It keeps every entry the log
 // already holds, truncates the log at the first entry that conflicts, and
