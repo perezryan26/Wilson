@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // broadcastAppend sends AppendEntries to every other server.
 func (n *Node) broadcastAppend() {
@@ -98,8 +101,30 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	}
 	n.matchIndex[from] = resp.MatchIndex
 	n.nextIndex[from] = resp.MatchIndex + 1
+	n.maybeCommit()
 	if n.nextIndex[from] <= n.log.lastIndex() {
 		n.sendAppend(from)
+	}
+}
+
+// maybeCommit sets commitIndex to the highest index a majority of servers
+// store, the leader's own log included, if that entry is from the current
+// term (Figure 2, leaders). §5.4.2: an entry from an earlier term is never
+// committed by counting replicas, because a later leader could still
+// overwrite it (Figure 8); it commits with the first entry of this term.
+func (n *Node) maybeCommit() {
+	matched := make([]Index, len(n.peers))
+	for i, id := range n.peers {
+		matched[i] = n.matchIndex[id]
+		if id == n.id {
+			matched[i] = n.log.lastIndex()
+		}
+	}
+	slices.Sort(matched)
+	// A majority of servers have matched at least this far.
+	index := matched[(len(matched)-1)/2]
+	if term, _ := n.log.term(index); term == n.currentTerm {
+		n.commitTo(index)
 	}
 }
 

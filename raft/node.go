@@ -218,6 +218,7 @@ func (n *Node) Propose(cmd []byte) (Index, Term, error) {
 	e := Entry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Data: cmd}
 	n.log.append(e)
 	n.broadcastAppend()
+	n.maybeCommit()
 	return e.Index, e.Term, nil
 }
 
