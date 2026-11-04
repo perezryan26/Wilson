@@ -42,8 +42,12 @@ type Cluster struct {
 	net     Network
 	blocked map[link]bool // links cut by a partition or a cut
 
-	leaders map[raft.Term]raft.NodeID // every leader seen, by term
-	err     error                     // the first violation, which ends the run
+	// What the checks have seen, over all servers and boots.
+	leaders   map[raft.Term]raft.NodeID // every leader, by term
+	entries   map[logKey]entryInfo      // every entry ever stored
+	committed []commitment              // entries known committed, from index 1
+	applied   []raft.Entry              // entries applied, from index 1
+	err       error                     // the first violation, which ends the run
 
 	trace         strings.Builder
 	traceMessages bool
@@ -61,6 +65,8 @@ type node struct {
 
 	maxTerm raft.Term                 // highest currentTerm seen, across restarts
 	votes   map[raft.Term]raft.NodeID // every vote the server saved, by term
+	log     []raft.Entry              // the log as stored, from index 1
+	applied raft.Index                // the last index applied since this boot
 }
 
 // New returns a cluster of opts.Size servers, all up and connected, at
@@ -71,6 +77,7 @@ func New(opts Options) *Cluster {
 		net:     DefaultNetwork(),
 		blocked: map[link]bool{},
 		leaders: map[raft.Term]raft.NodeID{},
+		entries: map[logKey]entryInfo{},
 
 		traceMessages: opts.TraceMessages,
 	}
@@ -240,6 +247,8 @@ func (c *Cluster) boot(n *node) {
 	n.core = raft.NewNode(cfg, restored)
 	n.boots++
 	n.status = n.core.Status()
+	n.log = restored.Entries
+	n.applied = 0
 	c.tracef("%s boot term=%d votedFor=%s tick=%s", name(n.id), restored.HardState.CurrentTerm,
 		name(restored.HardState.VotedFor), ms(n.period))
 	c.tick(n, n.boots, c.now+c.randDuration(0, n.period))
@@ -259,7 +268,8 @@ func (c *Cluster) tick(n *node, boot int, at time.Duration) {
 }
 
 // handleReady carries out n's Ready as the runtime does: it saves the hard
-// state, then sends the messages.
+// state and entries, then sends the messages, then applies the committed
+// entries.
 func (c *Cluster) handleReady(n *node) {
 	rd := n.core.Ready()
 	if rd.HardState != nil {
@@ -269,8 +279,12 @@ func (c *Cluster) handleReady(n *node) {
 		c.fail(fmt.Errorf("server %d: save: %w", n.id, err))
 		return
 	}
+	c.store(n, rd.Entries)
 	for _, m := range rd.Messages {
 		c.send(m)
+	}
+	for _, e := range rd.CommittedEntries {
+		c.apply(n, e)
 	}
 }
 
@@ -282,6 +296,8 @@ func (c *Cluster) observe() {
 			continue
 		}
 		st := n.core.Status()
+		c.checkCommits(n, st)
+		c.checkNewLeader(n, st)
 		if st != n.status {
 			c.tracef("%s %s", name(n.id), change(n.status, st))
 			n.status = st
