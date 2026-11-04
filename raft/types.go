@@ -90,11 +90,18 @@ type AppendEntriesResponse struct {
 
 // Ready holds the effects a node produced since the previous call to
 // Node.Ready. The runtime carries them out in field order: it persists and
-// fsyncs HardState before it sends Messages, so a granted vote never
-// leaves before the vote is durable (docs/adr/0001-deterministic-core.md).
+// fsyncs HardState and Entries before it sends Messages, so a granted vote
+// or an acknowledged entry never leaves before it is durable
+// (docs/adr/0001-deterministic-core.md).
 type Ready struct {
 	// HardState is the hard state to persist, or nil if it is unchanged.
 	HardState *HardState
-	// Messages are the messages to send once HardState is durable.
+	// Entries are log entries to persist, in index order. When
+	// Entries[0].Index is at or below the last stored index, storage first
+	// discards every stored entry from that index on, because the node is
+	// overwriting a conflicting suffix (Figure 2, AppendEntries step 3).
+	Entries []Entry
+	// Messages are the messages to send once HardState and Entries are
+	// durable.
 	Messages []Message
 }

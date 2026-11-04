@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"errors"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -166,5 +168,45 @@ func TestNewNodeRestoresHardState(t *testing.T) {
 	n.Step(voteRequest(3, 5, 0, 0))
 	if got := voteReply(t, n.Ready(), 3); got.VoteGranted {
 		t.Error("granted a second vote in term 5 after a restart")
+	}
+}
+
+// wantEntries checks that got holds exactly the entries in want.
+func wantEntries(t *testing.T, what string, got, want []Entry) {
+	t.Helper()
+	same := slices.EqualFunc(got, want, func(a, b Entry) bool {
+		return a.Index == b.Index && a.Term == b.Term && string(a.Data) == string(b.Data)
+	})
+	if !same {
+		t.Errorf("%s = %v, want %v", what, got, want)
+	}
+}
+
+// Figure 2, leaders: a command from a client is appended to the leader's
+// log as an entry of the current term. Each new entry reaches storage once,
+// through the next Ready.
+func TestProposeAppendsOnLeader(t *testing.T) {
+	n := newLeader(t, 3)
+	for i, cmd := range []string{"x", "y"} {
+		index, term, err := n.Propose([]byte(cmd))
+		if err != nil || index != Index(i+1) || term != 1 {
+			t.Fatalf("Propose(%q) = %d, %d, %v; want %d, 1, nil", cmd, index, term, err, i+1)
+		}
+		want := []Entry{{Index: Index(i + 1), Term: 1, Data: []byte(cmd)}}
+		wantEntries(t, "Ready entries", n.Ready().Entries, want)
+	}
+}
+
+// Only the leader accepts commands; any other server refuses them and
+// appends nothing.
+func TestProposeRefusedOffLeader(t *testing.T) {
+	for _, n := range []*Node{newTestNode(1, 3, 1), newCandidate(t, 3)} {
+		role := n.Status().Role
+		if _, _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
+			t.Errorf("%v: Propose error = %v, want ErrNotLeader", role, err)
+		}
+		if rd := n.Ready(); len(rd.Entries) != 0 {
+			t.Errorf("%v: Ready entries = %v, want none", role, rd.Entries)
+		}
 	}
 }

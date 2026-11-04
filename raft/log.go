@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // raftLog is Figure 2's log[]: entries indexed from 1, after a sentinel
 // entry at index 0 with term 0, so the entry before the first one always
@@ -26,6 +29,14 @@ func (l *raftLog) lastIndex() Index { return l.entries[len(l.entries)-1].Index }
 
 // lastTerm returns the term of the last entry, or 0 if the log is empty.
 func (l *raftLog) lastTerm() Term { return l.entries[len(l.entries)-1].Term }
+
+// append adds e, which follows the last entry, to the log.
+func (l *raftLog) append(e Entry) { l.entries = append(l.entries, e) }
+
+// from returns a copy of the entries from index i to the end. A copy, so
+// that a later truncation of the log cannot rewrite entries already handed
+// out in a message or a Ready.
+func (l *raftLog) from(i Index) []Entry { return slices.Clone(l.entries[i-l.entries[0].Index:]) }
 
 // term returns the term of the entry at index i, and false if the log has
 // no entry there. Index 0 is the sentinel, of term 0.

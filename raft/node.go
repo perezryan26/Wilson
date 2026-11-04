@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// ErrNotLeader is the error Propose returns on a server that is not the
+// leader. The caller should retry at the leader, which Status names when
+// this server knows it.
+var ErrNotLeader = errors.New("raft: not the leader")
+
 // Config holds what NewNode needs to know about the server and its cluster.
 type Config struct {
 	// ID identifies this server. It must be one of Peers.
@@ -123,6 +128,7 @@ type Node struct {
 
 	msgs          []Message // messages for the next Ready
 	prevHardState HardState // the hard state as of the last Ready
+	unstable      Index     // the first log index not yet handed to storage
 }
 
 // NewNode returns a server that starts as a follower (§5.2) with the state
@@ -143,6 +149,7 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		votedFor:      hs.VotedFor,
 		log:           newLog(restored.Entries),
 		prevHardState: hs,
+		unstable:      Index(len(restored.Entries)) + 1,
 	}
 	n.becomeFollower(hs.CurrentTerm, None)
 	n.resetElectionTimer()
@@ -192,12 +199,29 @@ func (n *Node) Step(m Message) {
 	// A heartbeat's response matters only for its term, handled above.
 }
 
+// Propose appends cmd to the leader's log as a new entry of the current
+// term and returns the entry's index and term (Figure 2, leaders). The
+// entry counts as committed only once a majority stores it; until then a
+// later leader may overwrite it.
+func (n *Node) Propose(cmd []byte) (Index, Term, error) {
+	if n.role != Leader {
+		return 0, 0, ErrNotLeader
+	}
+	e := Entry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Data: cmd}
+	n.log.append(e)
+	return e.Index, e.Term, nil
+}
+
 // Ready returns the effects produced since the previous call and clears
 // them. The runtime handles each Ready completely, persisting before it
 // sends, before it calls the node again.
 func (n *Node) Ready() Ready {
 	rd := Ready{Messages: n.msgs}
 	n.msgs = nil
+	if n.unstable <= n.log.lastIndex() {
+		rd.Entries = n.log.from(n.unstable)
+		n.unstable = n.log.lastIndex() + 1
+	}
 	if hs := (HardState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor}); hs != n.prevHardState {
 		rd.HardState = &hs
 		n.prevHardState = hs
