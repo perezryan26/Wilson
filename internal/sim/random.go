@@ -114,14 +114,32 @@ func (c *Cluster) randomFault() {
 	}
 }
 
-// randomCrash crashes server id at once, between events, or during one of
-// its next six disk operations, losing whatever it had not synced.
+// randomCrash crashes a server: half the time the current leader, if one
+// is up, since leaders that crash and come back are how Figure 8's hazard
+// arises, and otherwise id. Half the crashes happen at once, between
+// events; the rest strike during one of the server's next six disk
+// operations and lose whatever it had not synced.
 func (c *Cluster) randomCrash(id raft.NodeID) {
+	if lead := c.currentLeader(); lead != raft.None && c.rng.IntN(2) == 0 {
+		id = lead
+	}
 	if c.rng.IntN(2) == 0 {
 		c.Crash(id)
 		return
 	}
 	c.CrashDuringDiskOp(id, 1+c.rng.IntN(6))
+}
+
+// currentLeader returns the running server that leads the highest term,
+// or None if no running server believes it leads.
+func (c *Cluster) currentLeader() raft.NodeID {
+	lead, term := raft.None, raft.Term(0)
+	for _, id := range c.ids() {
+		if st, up := c.Status(id); up && st.Role == raft.Leader && st.Term > term {
+			lead, term = id, st.Term
+		}
+	}
+	return lead
 }
 
 // randomGroups splits the servers into two or three groups at random,
