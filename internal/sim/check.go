@@ -20,7 +20,10 @@ func (c *Cluster) checkElectionSafety(n *node, st raft.Status) {
 }
 
 // checkTerm fails the run if n's currentTerm ever decreases, even across a
-// restart (Figure 2: it increases monotonically).
+// restart (Figure 2: it increases monotonically). It runs after every
+// event, when every running server's term is durable. A term lost to a
+// crash in the middle of its Save is never seen here, and never left in a
+// message.
 func (c *Cluster) checkTerm(n *node, st raft.Status) {
 	if st.Term < n.maxTerm {
 		c.fail(fmt.Errorf("server %d: currentTerm fell from %d to %d", n.id, n.maxTerm, st.Term))
@@ -29,8 +32,10 @@ func (c *Cluster) checkTerm(n *node, st raft.Status) {
 	n.maxTerm = st.Term
 }
 
-// checkVote fails the run if the hard state n is about to save votes for a
-// second candidate in a term, even after a restart.
+// checkVote fails the run if n votes for a second candidate in a term,
+// even after a restart. It sees each vote once it is durable: when its
+// Save returns, and when a restart loads it. A vote lost to a crash in the
+// middle of its Save never left in a reply, so it binds no one.
 func (c *Cluster) checkVote(n *node, hs raft.HardState) {
 	if hs.VotedFor == raft.None {
 		return
@@ -40,6 +45,19 @@ func (c *Cluster) checkVote(n *node, hs raft.HardState) {
 		return
 	}
 	n.votes[hs.CurrentTerm] = hs.VotedFor
+}
+
+// checkRestored fails the run if a restarting server lost state that a
+// Save had made durable: if it comes back in a term below the highest it
+// saved, or with a vote other than the one it saved for that term. A
+// crash in the middle of a Save may lose that Save's writes, but nothing
+// saved before.
+func (c *Cluster) checkRestored(n *node, hs raft.HardState) {
+	if hs.CurrentTerm < n.maxTerm {
+		c.fail(fmt.Errorf("server %d restarted in term %d after saving term %d", n.id, hs.CurrentTerm, n.maxTerm))
+		return
+	}
+	c.checkVote(n, hs)
 }
 
 // logKey names an entry by index and term, which Log Matching says name it

@@ -17,14 +17,15 @@ import (
 var ErrCrashed = errors.New("storage: simulated crash")
 
 // FaultFS is a file system in memory that crashes on demand, for crash
-// tests. A crash keeps what was synced and a random part of the rest, as
-// a power failure would: a prefix of each file's writes and truncations
-// since its last Sync, the last write possibly cut short mid-record, and
-// a prefix of the files created since their directory's last SyncDir. All
-// its randomness comes from the source NewFaultFS is given, so a seed
-// replays a crash exactly. It supports what file storage does: creating
-// files, appending to them, truncating, reading them whole, listing, and
-// syncing. A FaultFS is not safe for concurrent use.
+// tests and the simulator. A crash keeps what was synced and a random
+// part of the rest, as a power failure would: a prefix of each file's
+// writes and truncations since its last Sync, the last write possibly cut
+// short mid-record, and a prefix of the files created since their
+// directory's last SyncDir. All its randomness comes from the source
+// NewFaultFS is given, so a seed replays a crash exactly. It supports
+// what file storage does: creating files, appending to them, truncating,
+// reading them whole, listing, and syncing. A FaultFS is not safe for
+// concurrent use.
 type FaultFS struct {
 	rand    *rand.Rand
 	files   map[string]*faultFile // every file, by path

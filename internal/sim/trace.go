@@ -2,6 +2,7 @@ package sim
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -13,6 +14,33 @@ func (c *Cluster) tracef(format string, args ...any) {
 	fmt.Fprintf(&c.trace, "t=%s ", ms(c.now))
 	fmt.Fprintf(&c.trace, format, args...)
 	c.trace.WriteByte('\n')
+}
+
+// logger returns a logger whose lines, such as recovery's report of a
+// record torn by a crash, go into the trace as server id's.
+func (c *Cluster) logger(id raft.NodeID) *slog.Logger {
+	return slog.New(slog.NewTextHandler(traceWriter{c, id}, &slog.HandlerOptions{ReplaceAttr: dropTimeAndLevel}))
+}
+
+// traceWriter adds each line written to it to the trace, as server id's.
+type traceWriter struct {
+	c  *Cluster
+	id raft.NodeID
+}
+
+func (w traceWriter) Write(p []byte) (int, error) {
+	w.c.tracef("%s %s", name(w.id), strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+// dropTimeAndLevel leaves the wall-clock time out of log lines, which
+// would make traces differ between runs, and the level, which adds
+// nothing there.
+func dropTimeAndLevel(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) == 0 && (a.Key == slog.TimeKey || a.Key == slog.LevelKey) {
+		return slog.Attr{}
+	}
+	return a
 }
 
 // traceMessage traces what happened to m, if message tracing is on. what

@@ -2,6 +2,7 @@ package sim
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -11,6 +12,14 @@ import (
 
 	"github.com/perezryan26/wilson/internal/storage"
 	"github.com/perezryan26/wilson/raft"
+)
+
+const (
+	// walDir is where each server keeps its WAL on its simulated disk.
+	walDir = "wal"
+	// segmentSize is small enough that servers start new WAL segments, and
+	// crash while doing so, within a run.
+	segmentSize = 1 << 10
 )
 
 // Options describe a simulated cluster.
@@ -53,12 +62,13 @@ type Cluster struct {
 	traceMessages bool
 }
 
-// node is one simulated server: a core while it runs, and storage that
-// survives its crashes.
+// node is one simulated server: a core and its file storage while it
+// runs, and a disk that survives its crashes, losing what was not synced.
 type node struct {
 	id      raft.NodeID
-	core    *raft.Node // nil while the server is down
-	storage storage.Memory
+	core    *raft.Node           // nil while the server is down
+	storage *storage.FileStorage // the WAL on disk; nil while the server is down
+	disk    *storage.FaultFS
 	period  time.Duration // this server's tick interval
 	boots   int           // how many times the server has started
 	status  raft.Status   // as of the last event, for the trace
@@ -87,6 +97,7 @@ func New(opts Options) *Cluster {
 		perMille := time.Duration(c.rng.IntN(401) - 200)
 		c.nodes = append(c.nodes, &node{
 			id:     raft.NodeID(i + 1),
+			disk:   storage.NewFaultFS(rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))),
 			period: tick * (1000 + perMille) / 1000,
 			votes:  map[raft.Term]raft.NodeID{},
 		})
@@ -97,18 +108,44 @@ func New(opts Options) *Cluster {
 	return c
 }
 
-// Crash stops server id. It loses everything but its storage, and messages
-// that arrive while it is down are lost.
+// Crash stops server id between two events, as a power failure would. It
+// loses everything but its disk, and messages that arrive while it is
+// down are lost. Every Save synced its writes before it returned, so the
+// disk loses nothing here; CrashDuringDiskOp crashes a server mid-write.
 func (c *Cluster) Crash(id raft.NodeID) {
 	if n := c.node(id); n.core != nil {
-		n.core = nil
-		c.tracef("%s crash", name(id))
+		n.disk.Crash()
+		c.down(n, "crash")
 	}
+}
+
+// CrashDuringDiskOp makes server id, if it is up, crash during its opth
+// disk operation from now: a write, truncation, file creation, or fsync.
+// The crash keeps a random part of what the server had not synced,
+// possibly a record cut short, and the Save under way fails, so none of
+// that Ready's messages leave and none of its entries are applied. op = 0
+// cancels a crash still to come.
+func (c *Cluster) CrashDuringDiskOp(id raft.NodeID, op int) {
+	n := c.node(id)
+	if n.core == nil {
+		return
+	}
+	n.disk.CrashAfter(op)
+	if op > 0 {
+		c.tracef("%s will crash during disk operation %d from now", name(id), op)
+	}
+}
+
+// down records that n has stopped: its core and open storage are gone.
+func (c *Cluster) down(n *node, how string) {
+	n.core, n.storage = nil, nil
+	c.tracef("%s %s", name(n.id), how)
 }
 
 // Propose hands cmd to server id, as a client would, and carries out the
 // server's Ready. It returns the new entry's index and term, or
-// raft.ErrNotLeader, or an error if the server is down.
+// raft.ErrNotLeader, or an error if the server is down or crashed while
+// saving the entry.
 func (c *Cluster) Propose(id raft.NodeID, cmd []byte) (raft.Index, raft.Term, error) {
 	n := c.node(id)
 	if n.core == nil {
@@ -122,10 +159,13 @@ func (c *Cluster) Propose(id raft.NodeID, cmd []byte) (raft.Index, raft.Term, er
 	c.tracef("%s propose %s: index=%d term=%d", name(id), cmd, index, term)
 	c.handleReady(n)
 	c.observe()
+	if n.core == nil {
+		return 0, 0, fmt.Errorf("server %d crashed while saving the entry", id)
+	}
 	return index, term, nil
 }
 
-// Restart boots server id from its storage, if it is down.
+// Restart boots server id from its disk, if it is down.
 func (c *Cluster) Restart(id raft.NodeID) {
 	if n := c.node(id); n.core == nil {
 		c.boot(n)
@@ -232,14 +272,16 @@ func (c *Cluster) schedule(at time.Duration, run func()) {
 	heap.Push(&c.queue, &event{at: at, key: c.rng.Uint64(), seq: c.seq, run: run})
 }
 
-// boot starts n's core from its storage, with its first tick at a random
-// phase so that servers do not tick in step.
+// boot recovers n's file storage from its disk and starts its core from
+// what that holds, with the first tick at a random phase so that servers
+// do not tick in step.
 func (c *Cluster) boot(n *node) {
-	restored, err := n.storage.Load()
+	restored, err := c.recover(n)
 	if err != nil {
-		c.fail(fmt.Errorf("server %d: load: %w", n.id, err))
+		c.fail(fmt.Errorf("server %d: %w", n.id, err))
 		return
 	}
+	c.checkRestored(n, restored.HardState)
 	cfg, _ := raft.DefaultConfig()
 	cfg.ID = n.id
 	cfg.Peers = c.ids()
@@ -249,9 +291,21 @@ func (c *Cluster) boot(n *node) {
 	n.status = n.core.Status()
 	n.log = restored.Entries
 	n.applied = 0
-	c.tracef("%s boot term=%d votedFor=%s tick=%s", name(n.id), restored.HardState.CurrentTerm,
-		name(restored.HardState.VotedFor), ms(n.period))
+	c.tracef("%s boot term=%d votedFor=%s lastIndex=%d tick=%s", name(n.id), restored.HardState.CurrentTerm,
+		name(restored.HardState.VotedFor), len(restored.Entries), ms(n.period))
 	c.tick(n, n.boots, c.now+c.randDuration(0, n.period))
+}
+
+// recover opens n's WAL on its disk and returns what it holds. Recovery's
+// report of a record torn by a crash goes into the trace.
+func (c *Cluster) recover(n *node) (raft.RestoredState, error) {
+	opts := storage.FileOptions{SegmentSize: segmentSize, Logger: c.logger(n.id)}
+	st, err := storage.OpenFileStorage(n.disk, walDir, opts)
+	if err != nil {
+		return raft.RestoredState{}, err
+	}
+	n.storage = st
+	return st.Load()
 }
 
 // tick schedules n's next tick at virtual time at. A tick left over from an
@@ -269,15 +323,19 @@ func (c *Cluster) tick(n *node, boot int, at time.Duration) {
 
 // handleReady carries out n's Ready as the runtime does: it saves the hard
 // state and entries, then sends the messages, then applies the committed
-// entries.
+// entries. A crash during the Save takes n down with nothing sent.
 func (c *Cluster) handleReady(n *node) {
 	rd := n.core.Ready()
-	if rd.HardState != nil {
-		c.checkVote(n, *rd.HardState)
-	}
 	if err := n.storage.Save(rd); err != nil {
+		if errors.Is(err, storage.ErrCrashed) {
+			c.down(n, "crash during a disk write")
+			return
+		}
 		c.fail(fmt.Errorf("server %d: save: %w", n.id, err))
 		return
+	}
+	if rd.HardState != nil {
+		c.checkVote(n, *rd.HardState)
 	}
 	c.store(n, rd.Entries)
 	for _, m := range rd.Messages {

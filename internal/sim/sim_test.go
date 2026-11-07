@@ -3,6 +3,7 @@ package sim_test
 import (
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -188,4 +189,71 @@ func TestCrashedLeaderIsReplaced(t *testing.T) {
 		}
 		awaitLeader(t, c)
 	}
+}
+
+// anyLeader returns a running server that believes it leads, or None.
+func anyLeader(c *sim.Cluster) raft.NodeID {
+	for id := raft.NodeID(1); id <= 5; id++ {
+		if st, up := c.Status(id); up && st.Role == raft.Leader {
+			return id
+		}
+	}
+	return raft.None
+}
+
+// Servers that crash in the middle of disk writes, losing whatever they
+// had not synced, restart from their WAL without breaking any invariant.
+// In a cluster of five that takes a proposal every 200 ms, a server picked
+// at random is set to crash during one of its next four disk operations
+// just as often, and crashed servers restart. Afterwards the cluster
+// still agrees on a leader and applies a new command everywhere.
+func TestCrashesMidWriteKeepSafety(t *testing.T) {
+	crashes := 0
+	for seed := range uint64(10) {
+		c := sim.New(sim.Options{Size: 5, Seed: seed})
+		pick := rand.New(rand.NewPCG(seed, 1))
+		for round := range 100 {
+			for id := raft.NodeID(1); id <= 5; id++ {
+				c.Restart(id)
+			}
+			c.CrashDuringDiskOp(raft.NodeID(1+pick.IntN(5)), 1+pick.IntN(4))
+			if lead := anyLeader(c); lead != raft.None {
+				_, _, _ = c.Propose(lead, fmt.Appendf(nil, "c%d", round))
+			}
+			if err := c.RunFor(200 * time.Millisecond); err != nil {
+				t.Fatalf("seed %d: %v\n%s", seed, err, c.Trace())
+			}
+		}
+		crashes += strings.Count(c.Trace(), "crash during a disk write")
+		for id := raft.NodeID(1); id <= 5; id++ {
+			c.CrashDuringDiskOp(id, 0)
+			c.Restart(id)
+		}
+		if err := applyEverywhere(t, c); err != nil {
+			t.Fatalf("seed %d: %v\n%s", seed, err, c.Trace())
+		}
+	}
+	t.Logf("%d crashes during disk writes", crashes)
+	if crashes < 500 {
+		t.Errorf("only %d of 1,000 rounds crashed a server during a disk write", crashes)
+	}
+}
+
+// applyEverywhere proposes a command once c agrees on a leader and runs c
+// until all five servers apply it.
+func applyEverywhere(t *testing.T, c *sim.Cluster) error {
+	t.Helper()
+	lead, _ := awaitLeader(t, c)
+	index, _, err := c.Propose(lead, []byte("last"))
+	if err != nil {
+		return err
+	}
+	return c.RunUntil(10*time.Second, "every server to apply the last command", func() bool {
+		for id := raft.NodeID(1); id <= 5; id++ {
+			if st, up := c.Status(id); !up || st.LastApplied < index {
+				return false
+			}
+		}
+		return true
+	})
 }

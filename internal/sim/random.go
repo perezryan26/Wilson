@@ -106,12 +106,22 @@ func (c *Cluster) randomFault() {
 			c.Cut(id, other)
 		}
 	case 5:
-		c.Crash(id)
+		c.randomCrash(id)
 	case 6, 7:
 		c.Restart(id)
 	default:
 		c.SetNetwork(c.randomNetwork())
 	}
+}
+
+// randomCrash crashes server id at once, between events, or during one of
+// its next six disk operations, losing whatever it had not synced.
+func (c *Cluster) randomCrash(id raft.NodeID) {
+	if c.rng.IntN(2) == 0 {
+		c.Crash(id)
+		return
+	}
+	c.CrashDuringDiskOp(id, 1+c.rng.IntN(6))
 }
 
 // randomGroups splits the servers into two or three groups at random,
@@ -141,11 +151,13 @@ func (c *Cluster) randomNetwork() Network {
 }
 
 // healAll ends every fault: it heals all links, restores the default
-// network, and restarts every crashed server.
+// network, cancels crashes still to come, and restarts every crashed
+// server.
 func (c *Cluster) healAll() {
 	c.Heal()
 	c.SetNetwork(DefaultNetwork())
 	for _, id := range c.ids() {
+		c.CrashDuringDiskOp(id, 0)
 		c.Restart(id)
 	}
 }
