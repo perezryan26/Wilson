@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -42,9 +43,11 @@ func sameState(a, b raft.RestoredState) bool {
 	})
 }
 
+// openFileStorage opens file storage with 64-byte segments, discarding
+// recovery's log lines.
 func openFileStorage(t *testing.T, fsys FS, dir string) *FileStorage {
 	t.Helper()
-	s, err := OpenFileStorage(fsys, dir, FileOptions{SegmentSize: 64})
+	s, err := OpenFileStorage(fsys, dir, FileOptions{SegmentSize: 64, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
