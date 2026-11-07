@@ -2,13 +2,13 @@
 
 A linearizable key-value store built on the Raft consensus algorithm, written in Go from scratch and meant to be read beside the [extended Raft paper](https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf).
 
-> **Status: log replication.** The Raft core elects leaders and replicates a log, so committed commands are applied in the same order on every server. Unit tests, scripted scenarios from the paper's Figures 7 and 8, and a deterministic simulator that injects partitions, crashes, and message faults show it. Durable storage, snapshots, the runtime, and the key-value service are not written yet. Each section below says what exists today.
+> **Status: durable storage.** The Raft core elects leaders and replicates a log, so committed commands are applied in the same order on every server, and each server keeps its hard state and log in a write-ahead log that survives a crash at any instant. Unit tests, scripted scenarios from the paper's Figures 7 and 8, crash tests at every write boundary of the storage, and a deterministic simulator that injects partitions, message faults, and crashes in the middle of disk writes show it. Snapshots, the runtime, and the key-value service are not written yet. Each section below says what exists today.
 
 ## Overview and guarantees
 
 Wilson is a replicated key-value store that keeps serving Get, Put, and Delete while a majority of its servers are up. It implements §5–§8 of the paper by Ongaro and Ousterhout: leader election, log replication, safety, membership changes, log compaction, and client interaction. The code is written to be read and maintained by people, with the paper open beside it.
 
-The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far the five Figure 3 properties have evidence: the deterministic simulator checks each after every event under thousands of randomized fault schedules, beside unit tests and scenarios from the paper (see [Verification](#verification)). The others wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
+The table lists the guarantees the system is built to provide and the evidence each one will rest on. So far the five Figure 3 properties and durability have evidence. The deterministic simulator checks each property after every event under thousands of randomized fault schedules, with servers that crash mid-write and restart from their write-ahead log, beside unit tests, scenarios from the paper, and crash tests of the storage at every write boundary (see [Verification](#verification)). The chaos test and the other guarantees wait for the code they depend on. The first five rows are the paper's Figure 3 properties.
 
 | Guarantee | Meaning | Verified by |
 | --- | --- | --- |
@@ -68,12 +68,12 @@ Every package below exists with its package documentation. Only `raft/`, `intern
 
 - **`raft/`** is the core: roles, RPC handlers, the log, the commit rule, snapshots, and membership. It imports only the standard library, and the same seed and inputs always produce the same outputs. So far it implements leader election and log replication: the three roles, the randomized election timer, RequestVote, proposals, AppendEntries with the consistency check and fast backtracking, and the commit rule. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes its contract with the runtime.
 - **`node/`** is the runtime. One goroutine feeds the core ticks, inbound messages, and proposals, then handles each `Ready` in order: persist and fsync, send, apply. A storage error stops the process.
-- **`internal/storage/`** persists hard state, log entries, and snapshots. It holds an in-memory implementation for tests and a file implementation built on a segmented write-ahead log. So far only the in-memory implementation exists, and it keeps hard state and the log.
+- **`internal/storage/`** persists hard state and log entries, and, with log compaction, snapshots. `FileStorage` keeps a segmented write-ahead log on disk, fsyncs every save before returning, and recovers from a crash at any instant: it truncates a record torn by the crash and refuses to start on any other damage ([ADR-0003](docs/adr/0003-wal-format.md)). `Memory` keeps the same state in memory, for tests. File storage reaches the disk through a small file-system interface, so tests and the simulator run it on `FaultFS`, which crashes on demand and loses what was not synced.
 - **`internal/transport/`** carries Raft messages between nodes as JSON over HTTP/1.1 ([ADR-0002](docs/adr/0002-http-json-transport.md)).
 - **`internal/kv/`** is the replicated state machine: the command encoding, Get, Put, and Delete, and the per-client session table that makes retried writes apply once.
 - **`internal/kvserver/`** is the client-facing HTTP API. It proposes commands, waits for them to apply, and points clients at the leader.
 - **`client/`** is the Go client library: leader discovery, retries, client IDs, and sequence numbers.
-- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event. So far it checks the five Figure 3 properties, that terms never fall, one vote per term, and the order entries are applied in, plus liveness once faults heal.
+- **`internal/sim/`** is the deterministic simulator: a virtual clock, a simulated network with injected faults, crashes and restarts, and an invariant checker that runs after every event. Each server keeps its log in the real file storage on a simulated disk that a crash can strike mid-write. So far it checks the five Figure 3 properties, that terms never fall and votes are never cast twice in a term, even across restarts, and the order entries are applied in, plus liveness once faults heal.
 - **`internal/linearizability/`** holds the Porcupine model and the history recorder.
 - **`cmd/kvnode/`** and **`cmd/kvctl/`** are the server and CLI binaries.
 - **`test/chaos/`** is the multi-process chaos test.
@@ -82,11 +82,12 @@ Every package below exists with its package documentation. Only `raft/`, `intern
 
 ## Paper-to-code map
 
-Each row names a concept or rule from the paper, the code that implements it, and the tests that cover it. The rows cover §5.1–§5.5, every rule of Figure 2, and the Figure 3 properties. Every test named here is in `raft/`, except those marked (sim), which are in `internal/sim/`.
+Each row names a concept or rule from the paper, the code that implements it, and the tests that cover it. The rows cover §5.1–§5.5, every rule of Figure 2, and the Figure 3 properties. Every test named here is in `raft/`, except those marked (sim), which are in `internal/sim/`, and (storage), which are in `internal/storage/`.
 
 | Paper | Rule | Code | Tests |
 | --- | --- | --- | --- |
-| Figure 2, State | `currentTerm`, `votedFor`, and `log[]` reach stable storage before the server responds to an RPC | [`Node.Ready`](raft/node.go): a vote or new entries leave in the same `Ready` as the reply that depends on them, and the runtime persists before it sends ([ARCHITECTURE.md](docs/ARCHITECTURE.md#the-ready-contract)) | `TestVoteIsDurableBeforeReply`, `TestAppendEntriesReplacesConflictingEntries` |
+| Figure 2, State | `currentTerm`, `votedFor`, and `log[]` reach stable storage before the server responds to an RPC | [`Node.Ready`](raft/node.go): a vote or new entries leave in the same `Ready` as the reply that depends on them, and the runtime persists before it sends ([ARCHITECTURE.md](docs/ARCHITECTURE.md#the-ready-contract)); [`FileStorage.Save`](internal/storage/file.go) returns only after an fsync | `TestVoteIsDurableBeforeReply`, `TestAppendEntriesReplacesConflictingEntries`, `TestCrashAtEveryWriteBoundary` (storage) |
+| Figure 2, State | Persistent state survives a crash at any instant: nothing fsynced is lost, a crash mid-write loses at most that write, and damage refuses to start rather than pass for a crash | [`FileStorage`](internal/storage/file.go) and [the WAL's recovery](internal/storage/wal.go) ([ADR-0003](docs/adr/0003-wal-format.md)) | `TestCrashAtEveryWriteBoundary`, `TestTornFinalRecordIsTruncated`, `TestDamagedRecordRefusesToStart`, `TestMissingSegmentRefusesToStart` (storage); `TestCrashesMidWriteKeepSafety`, `TestRandomized` (sim) |
 | Figure 2, State | `currentTerm` starts at 0 and only increases; `votedFor` is null until the server votes in the current term | [`becomeFollower`, `becomeCandidate`](raft/node.go) | `TestRequestVoteRejectsStaleTerm`, `TestHigherTermInRequestStepsDown`, `TestRandomized` (sim) |
 | Figure 2, State | `log[]`: entries from index 1, each with a command and the term the leader received it in | [`raftLog`](raft/log.go), behind a sentinel at index 0 | `TestLogSentinel`, `TestNewLogRejectsGaps` |
 | Figure 2, State | `commitIndex` and `lastApplied` start at 0, only increase, and are volatile | [`commitTo`](raft/append_entries.go), [`Node.Ready`](raft/node.go) | `TestFollowerAdvancesCommitIndex`, `TestFollowerReleasesCommittedEntries` |
@@ -130,6 +131,7 @@ Each row names a concept or rule from the paper, the code that implements it, an
 | §5.4.2 | A leader never commits an entry from an earlier term by counting replicas; it commits with the first entry of its own term | [`maybeCommit`](raft/append_entries.go) | `TestFigure8OldTermEntryNotCommittedByCounting` |
 | §5.4.3; Figure 3, State Machine Safety | No two servers apply different entries at one index | The rules above, together | `TestRandomized` (sim) |
 | §5.5 | RPCs are idempotent: a repeated AppendEntries changes nothing | [`raftLog.merge`](raft/log.go) | `TestDuplicateAppendEntriesIsIdempotent`, `TestStaleAppendEntriesDoesNotTruncate` |
+| §5.5 | A follower or candidate that crashes restarts from its persisted state; one that crashed after completing an RPC but before responding receives the same RPC again | [`NewNode`](raft/node.go) restores the saved state; leaders resend entries with every heartbeat and candidates resend RequestVote | `TestCrashedLeaderIsReplaced`, `TestCrashesMidWriteKeepSafety`, `TestRandomized` (sim) |
 
 ## Verification
 
@@ -138,13 +140,13 @@ Six independent harnesses produce the evidence for correctness, and no single on
 | Harness | What it catches | How to run | State |
 | --- | --- | --- | --- |
 | Race detector | Data races in the runtime, transport, kvserver, and client | `make test` | Runs every test; the code so far is single-threaded |
-| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Checks the five Figure 3 properties, terms, votes, and applied order after every event, and liveness after faults heal |
+| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and clock skew | `make sim SEEDS=N` | Checks the five Figure 3 properties, terms, votes, and applied order after every event, with crashes in the middle of disk writes, and liveness after faults heal |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | Private adapter | Not built |
 | Porcupine | Client histories that are not linearizable | Inside the simulator and chaos tests | Not built |
-| Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | `make fuzz FUZZTIME=60s` | Wired; no targets yet |
+| Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | `make fuzz FUZZTIME=60s`; `go test ./internal/storage` | Fuzzes the WAL record decoder; crash tests at every write boundary of the storage |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Not built | Not built |
 
-The deterministic simulator runs whole clusters on a virtual clock under randomized partitions, crashes, restarts, and lossy, duplicating, slow networks, and checks the invariants after every event. A failing seed prints its trace, and `go test ./internal/sim -run TestRandomized -seed=N -v` replays it exactly, every message included. Unit tests drive one core with `Tick` and `Step`, and a synchronous three-node harness in `raft/` runs whole elections. [docs/TESTING.md](docs/TESTING.md) describes each, and how to read a trace.
+The deterministic simulator runs whole clusters on a virtual clock under randomized partitions, crashes, restarts, and lossy, duplicating, slow networks, and checks the invariants after every event. Servers keep their log in the real file storage on a simulated disk, and a crash can strike in the middle of a write. A failing seed prints its trace, and `go test ./internal/sim -run TestRandomized -seed=N -v` replays it exactly, every message included. The storage's crash tests run it on an in-memory file system that crashes during each write, truncation, file creation, and fsync, and check that recovery never loses a synced record. Unit tests drive one core with `Tick` and `Step`, and a synchronous three-node harness in `raft/` runs whole elections. [docs/TESTING.md](docs/TESTING.md) describes each, and how to read a trace.
 
 ## Deviations from the paper
 
@@ -208,3 +210,4 @@ None. Every deviation gets an ADR in [docs/adr/](docs/adr/) and a row here.
 | `phase-1` | 2026-10-27 | Core types and leader election: the three roles, the randomized election timer, RequestVote, heartbeats, in-memory storage, a three-node election harness, and `docs/ARCHITECTURE.md` |
 | `phase-2` | 2026-11-03 | The deterministic simulator: a virtual clock, a seeded event queue, message loss, duplication, and delay, partitions, crashes, restarts, invariant checks after every event, liveness after healing, traces, seed replay, and a nightly 50,000-seed sweep; candidates re-send unanswered RequestVotes |
 | `phase-3` | 2026-11-03 | Log replication and commitment: the log, proposals, AppendEntries with the consistency check and fast backtracking (ADR-0004), the commit rule, committed entries through `Ready`, Figures 7 and 8 as tests, and simulator checks for all five Figure 3 properties |
+| `phase-4` | 2026-11-06 | Durable storage and crash recovery: a segmented write-ahead log of CRC-32C records, recovery that truncates a torn final record and refuses any other damage (ADR-0003), a file system that crashes on demand with tests at every write boundary, fuzzing of the record decoder, and simulator servers that crash mid-write, half of all crashes aimed at the leader |

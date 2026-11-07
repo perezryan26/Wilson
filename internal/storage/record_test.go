@@ -3,8 +3,10 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/perezryan26/wilson/raft"
@@ -141,4 +143,30 @@ func FuzzWALRecordDecode(f *testing.F) {
 			t.Fatalf("records decoded from %x encode as %x", b[:off], again)
 		}
 	})
+}
+
+// The record layout is fixed (docs/adr/0003-wal-format.md). These are the
+// bytes docs/ARCHITECTURE.md shows for a record of each type; an encoder
+// that changed them would no longer read the WALs already on disk.
+func TestRecordBytes(t *testing.T) {
+	cases := []struct {
+		r   record
+		hex string
+	}{
+		{record{typ: recordHardState, hardState: raft.HardState{CurrentTerm: 3, VotedFor: 2}},
+			"11000000 0be58904 01 0300000000000000 0200000000000000"},
+		{record{typ: recordEntry, entry: raft.Entry{Index: 7, Term: 3, Data: []byte("x=1")}},
+			"15000000 88fb3f2f 02 0700000000000000 0300000000000000 00 783d31"},
+		{record{typ: recordTruncate, index: 5},
+			"09000000 c09b6bca 03 0500000000000000"},
+	}
+	for _, c := range cases {
+		want, err := hex.DecodeString(strings.ReplaceAll(c.hex, " ", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := appendRecord(nil, c.r); !bytes.Equal(got, want) {
+			t.Errorf("%+v encodes as % x, want % x", c.r, got, want)
+		}
+	}
 }

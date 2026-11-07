@@ -52,9 +52,62 @@ for each input, a tick or an inbound message {
 }
 ```
 
-Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages ([TESTING.md](TESTING.md#deterministic-simulator)). The runtime in `node/` is not written yet.
+Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). The runtime in `node/` is not written yet.
 
 `NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote and that log. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at 0, relearns what is committed from the leader, and applies its log again from the start.
+
+## Storage
+
+The runtime persists through the `Storage` interface in [`internal/storage`](../internal/storage): `Save(Ready)` returns once the `Ready`'s hard state and entries are durable, and `Load` returns what a server restarts from. `Memory` keeps both in memory, for tests. `FileStorage` keeps them in a write-ahead log (WAL) on disk, with a copy in memory for `Load`; [ADR-0003](adr/0003-wal-format.md) records why the format is what it is.
+
+### Records
+
+The WAL is a sequence of records. Every number in one is little-endian.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | `length`: the size of `type` and `payload` together, at least 1 |
+| 4 | 4 | `crc32c`: the CRC-32C (Castagnoli) checksum of `type` and `payload` |
+| 8 | 1 | `type` |
+| 9 | `length` − 1 | `payload` |
+
+| `type` | Record | Payload |
+| --- | --- | --- |
+| 1 | Hard state | `currentTerm u64`, `votedFor u64` (0 for none): 16 bytes |
+| 2 | Entry | `index u64`, `term u64`, an entry type byte (0, a normal entry), then the command, to the end of the record: 17 bytes plus the command |
+| 3 | Truncation | `index u64`, the first of the stored entries to discard, all the rest with it: 8 bytes |
+
+Type 0 and every type above 3 are invalid. So is an entry type byte other than 0, until the election no-op and configuration entries arrive. Here are three records byte by byte, in hex: the hard state of term 3 with a vote for server 2, entry 7 of term 3 with the command `x=1`, and a truncation from index 5. `TestRecordBytes` checks that the encoder produces exactly these.
+
+```text
+length       crc32c       type  payload
+11 00 00 00  0b e5 89 04  01    03 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00
+                                currentTerm 3            votedFor 2
+
+15 00 00 00  88 fb 3f 2f  02    07 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00  00      78 3d 31
+                                index 7                  term 3                   normal  "x=1"
+
+09 00 00 00  c0 9b 6b ca  03    05 00 00 00 00 00 00 00
+                                index 5
+```
+
+### Segments and saves
+
+- The WAL lives in segment files in one directory, each named after the sequence number of its first record in 16 lowercase hex digits, such as `000000000000002a.wal` for a segment that begins with record 42. Records are numbered from 0 over the whole log, so the names sort in log order.
+- `Save` writes a `Ready`'s records with one write and one fsync, in a fixed order: the hard state, if it changed; a truncation, if the entries start at or below the last stored index; then one record per entry. A crash may keep any prefix of them, and every prefix is a safe state to restart from: the term is never behind an entry's, and a truncated suffix held only entries that conflict with the leader's, which are not committed.
+- Before a write, a segment that has reached the size limit (64 MiB by default) is closed and the next one is created. The directory is fsynced before any record goes into the new file, or a crash could make the file vanish with its records.
+- After a write or fsync fails, every later `Save` fails too: what the disk holds is unknown, and the runtime must stop.
+
+### Recovery
+
+`OpenFileStorage` replays every segment in order, and each segment must begin with the record after the previous segment's last.
+
+- **Torn final record.** In the last segment, a record that runs past the end of the file, its header or its body cut short, is a write torn by a crash, which no `Save` returned for. Recovery truncates the file where the record begins, fsyncs, and logs the segment, offset, and bytes dropped.
+- **Corruption.** Anything else refuses to start with an error wrapping `ErrCorrupt` that names the segment and offset: a checksum mismatch, an empty or malformed record, an entry that is not the next index, a truncation outside the log, a record cut short in an earlier segment, or a segment missing from the sequence. Starting anyway could forget a vote or an acknowledged entry.
+
+### File systems
+
+`FileStorage` reaches the disk only through `FS`: `OpenFile`, `ReadDir`, and `SyncDir`, with a `File` that reads, writes, syncs, truncates, and closes. `OSFS` is the operating system's file system. `FaultFS` lives in memory and crashes on demand, at once or during the nth write, truncation, file creation, or fsync. A crash keeps everything synced and a random prefix of the rest, as a power failure would: of each file's writes and truncations since its last fsync, the last write possibly cut mid-record, and of the files created since their directory's last fsync. Crash tests and the simulator run file storage on it.
 
 ## Log replication
 
@@ -110,3 +163,15 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, and the merge that carries out AppendEntries steps 3 and 4 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
 | [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, the leader's handling of replies, fast backtracking, and the commit rule |
+
+## Files in internal/storage/
+
+| File | Contents |
+| --- | --- |
+| [`storage.go`](../internal/storage/storage.go) | `Storage`, the interface the runtime persists through |
+| [`memory.go`](../internal/storage/memory.go) | `Memory`, storage in memory for tests |
+| [`file.go`](../internal/storage/file.go) | `FileStorage`, `OpenFileStorage`, and `FileOptions`: a `Ready` into WAL records, and records back into hard state and a log |
+| [`wal.go`](../internal/storage/wal.go) | Segments, appends, rotation, and recovery; `ErrCorrupt` |
+| [`record.go`](../internal/storage/record.go) | The record layout, its encoder, and its decoder |
+| [`fs.go`](../internal/storage/fs.go) | `FS`, `File`, and `OSFS` |
+| [`faultfs.go`](../internal/storage/faultfs.go) | `FaultFS`, the in-memory file system that crashes on demand; `ErrCrashed` |
