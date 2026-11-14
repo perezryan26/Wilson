@@ -202,15 +202,16 @@ func anyLeader(c *sim.Cluster) raft.NodeID {
 }
 
 // Servers that crash in the middle of disk writes, losing whatever they
-// had not synced, restart from their WAL without breaking any invariant.
-// In a cluster of five that takes a proposal every 200 ms, a server picked
-// at random is set to crash during one of its next four disk operations
-// just as often, and crashed servers restart. Afterwards the cluster
-// still agrees on a leader and applies a new command everywhere.
+// had not synced, restart from their WAL and snapshot without breaking
+// any invariant. In a cluster of five that takes a proposal every 200 ms
+// and compacts every three entries, a server picked at random is set to
+// crash during one of its next four disk operations just as often, and
+// crashed servers restart. Afterwards the cluster still agrees on a
+// leader and applies a new command everywhere.
 func TestCrashesMidWriteKeepSafety(t *testing.T) {
 	crashes := 0
 	for seed := range uint64(10) {
-		c := sim.New(sim.Options{Size: 5, Seed: seed})
+		c := sim.New(sim.Options{Size: 5, Seed: seed, CompactEvery: 3, SnapshotChunkSize: 16})
 		pick := rand.New(rand.NewPCG(seed, 1))
 		for round := range 100 {
 			for id := raft.NodeID(1); id <= 5; id++ {
@@ -256,4 +257,54 @@ func applyEverywhere(t *testing.T, c *sim.Cluster) error {
 		}
 		return true
 	})
+}
+
+// applyEverywhereIn proposes cmd once the servers among ids agree on a
+// leader, and runs c until each of them applies it.
+func applyEverywhereIn(t *testing.T, c *sim.Cluster, cmd string, ids ...raft.NodeID) {
+	t.Helper()
+	lead, _ := awaitLeader(t, c, ids...)
+	index, _, err := c.Propose(lead, []byte(cmd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.RunUntil(10*time.Second, fmt.Sprintf("servers %v to apply %s", ids, cmd), func() bool {
+		for _, id := range ids {
+			if st, up := c.Status(id); !up || st.LastApplied < index {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, c.Trace())
+	}
+}
+
+// §7: a server cut off while the others commit and compact far past it
+// catches up, once it is reachable again, from the leader's snapshot sent
+// in chunks, then applies the entries after it.
+func TestLaggingServerCatchesUpThroughSnapshot(t *testing.T) {
+	for seed := range uint64(10) {
+		c := sim.New(sim.Options{Size: 3, Seed: seed, TraceMessages: true, CompactEvery: 5, SnapshotChunkSize: 16})
+		lead, _ := awaitLeader(t, c)
+		lagging := lead%3 + 1
+		var others []raft.NodeID
+		for id := raft.NodeID(1); id <= 3; id++ {
+			if id != lagging {
+				others = append(others, id)
+			}
+		}
+		c.Partition(others, []raft.NodeID{lagging})
+		for i := range 30 {
+			applyEverywhereIn(t, c, fmt.Sprintf("c%d", i), others...)
+		}
+		c.Heal()
+		applyEverywhereIn(t, c, "last", 1, 2, 3)
+		installs := strings.Count(c.Trace(), fmt.Sprintf("n%d install snapshot", lagging))
+		chunks := strings.Count(c.Trace(), fmt.Sprintf("→n%d InstallSnapshot ", lagging))
+		if installs == 0 || chunks < 2 {
+			t.Errorf("seed %d: server %d installed %d snapshots from %d chunks, want at least one from several", seed, lagging, installs, chunks)
+		}
+	}
 }

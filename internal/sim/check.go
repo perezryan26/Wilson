@@ -1,7 +1,9 @@
 package sim
 
 import (
+	"bytes"
 	"fmt"
+	"slices"
 
 	"github.com/perezryan26/wilson/raft"
 )
@@ -99,6 +101,50 @@ func (c *Cluster) store(n *node, entries []raft.Entry) {
 	}
 }
 
+// storeSnapshot records that n saved snapshot s with the entries after
+// it, which together replace the log n had stored. A leader's snapshot
+// only compacts its log: the entries after it must be the ones it had
+// (Leader Append-Only).
+func (c *Cluster) storeSnapshot(n *node, s raft.Snapshot, entries []raft.Entry) {
+	if !c.checkSnapshot(n, s) {
+		return
+	}
+	last := s.LastIncludedIndex
+	if n.core.Status().Role == raft.Leader && !slices.EqualFunc(entries, n.log[last:], sameEntry) {
+		c.fail(fmt.Errorf("leader %d changed the entries after its snapshot through %d (Leader Append-Only)", n.id, last))
+		return
+	}
+	n.log = append(slices.Clone(c.applied[:last]), entries...)
+	n.snapshot = last
+	for _, e := range entries {
+		c.checkLogMatching(n, e)
+	}
+}
+
+// checkSnapshot fails the run, and reports false, unless snapshot s, which
+// n holds, is what a state machine that applied the entries s includes
+// holds, and its last included entry is the one applied at that index
+// (State Machine Safety).
+func (c *Cluster) checkSnapshot(n *node, s raft.Snapshot) bool {
+	last := s.LastIncludedIndex
+	switch {
+	case last == 0 || last > raft.Index(len(c.applied)):
+		c.fail(fmt.Errorf("server %d holds a snapshot through index %d, but %d entries have been applied", n.id, last, len(c.applied)))
+	case c.applied[last-1].Term != s.LastIncludedTerm:
+		c.fail(fmt.Errorf("server %d holds a snapshot through index %d of term %d, but the entry applied there has term %d",
+			n.id, last, s.LastIncludedTerm, c.applied[last-1].Term))
+	case !bytes.Equal(s.Data, c.stateAt(last)):
+		c.fail(fmt.Errorf("server %d holds a snapshot through index %d that differs from the state applied through it (State Machine Safety)", n.id, last))
+	default:
+		return true
+	}
+	return false
+}
+
+func sameEntry(a, b raft.Entry) bool {
+	return a.Index == b.Index && a.Term == b.Term && bytes.Equal(a.Data, b.Data)
+}
+
 // checkLogMatching fails the run if e differs, in command or in the term of
 // the entry before it, from any entry ever stored with e's index and term.
 // With the term before every entry pinned, two logs that share an entry's
@@ -135,13 +181,19 @@ func (c *Cluster) apply(n *node, e raft.Entry) {
 }
 
 // checkCommits records the entries n has newly learned are committed. The
-// run fails unless lastApplied ≤ commitIndex ≤ n's last log index, if two
-// different entries are ever committed at one index, or if a current leader
-// lacks a newly committed entry.
+// run fails unless lastApplied ≤ commitIndex ≤ n's last log index, if
+// either falls, if two different entries are ever committed at one index,
+// or if a current leader lacks a newly committed entry.
 func (c *Cluster) checkCommits(n *node, st raft.Status) {
 	if st.LastApplied > st.CommitIndex || st.CommitIndex > raft.Index(len(n.log)) {
 		c.fail(fmt.Errorf("server %d has lastApplied %d, commitIndex %d, and last log index %d",
 			n.id, st.LastApplied, st.CommitIndex, len(n.log)))
+		return
+	}
+	// Applied state never moves backwards, not even for a snapshot.
+	if st.CommitIndex < n.status.CommitIndex || st.LastApplied < n.status.LastApplied {
+		c.fail(fmt.Errorf("server %d moved commitIndex from %d to %d and lastApplied from %d to %d",
+			n.id, n.status.CommitIndex, st.CommitIndex, n.status.LastApplied, st.LastApplied))
 		return
 	}
 	for i := n.status.CommitIndex + 1; i <= st.CommitIndex; i++ {

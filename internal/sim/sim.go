@@ -2,6 +2,7 @@ package sim
 
 import (
 	"container/heap"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -33,6 +34,14 @@ type Options struct {
 	// which otherwise records boots, crashes, faults, and every change of
 	// role, term, or leader.
 	TraceMessages bool
+	// CompactEvery makes each server snapshot its state machine once it
+	// has applied that many entries past its latest snapshot (§7). Zero
+	// means servers never compact.
+	CompactEvery int
+	// SnapshotChunkSize is each server's raft.Config.SnapshotChunkSize:
+	// the most snapshot bytes one InstallSnapshot carries, or the whole
+	// snapshot if it is 0.
+	SnapshotChunkSize int
 }
 
 // Cluster is a simulated raft cluster. It runs every server in one
@@ -46,6 +55,9 @@ type Cluster struct {
 	seq   uint64 // events scheduled so far
 
 	commands int // commands proposed so far, for naming the next
+
+	compactEvery      int // see Options
+	snapshotChunkSize int
 
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
@@ -75,8 +87,13 @@ type node struct {
 
 	maxTerm raft.Term                 // highest currentTerm seen, across restarts
 	votes   map[raft.Term]raft.NodeID // every vote the server saved, by term
-	log     []raft.Entry              // the log as stored, from index 1
-	applied raft.Index                // the last index applied since this boot
+
+	// The log as stored, from index 1. The entries a snapshot replaced
+	// are the committed entries it stands for, so the log checks can go on
+	// reading them.
+	log      []raft.Entry
+	snapshot raft.Index // the last index the stored snapshot includes, or 0
+	applied  raft.Index // the last index the state machine applied
 }
 
 // New returns a cluster of opts.Size servers, all up and connected, at
@@ -89,7 +106,9 @@ func New(opts Options) *Cluster {
 		leaders: map[raft.Term]raft.NodeID{},
 		entries: map[logKey]entryInfo{},
 
-		traceMessages: opts.TraceMessages,
+		compactEvery:      opts.CompactEvery,
+		snapshotChunkSize: opts.SnapshotChunkSize,
+		traceMessages:     opts.TraceMessages,
 	}
 	_, tick := raft.DefaultConfig()
 	for i := range opts.Size {
@@ -274,7 +293,7 @@ func (c *Cluster) schedule(at time.Duration, run func()) {
 
 // boot recovers n's file storage from its disk and starts its core from
 // what that holds, with the first tick at a random phase so that servers
-// do not tick in step.
+// do not tick in step. The state machine restarts from the snapshot.
 func (c *Cluster) boot(n *node) {
 	restored, err := c.recover(n)
 	if err != nil {
@@ -282,17 +301,24 @@ func (c *Cluster) boot(n *node) {
 		return
 	}
 	c.checkRestored(n, restored.HardState)
+	n.snapshot, n.applied, n.log = 0, 0, restored.Entries
+	if s := restored.Snapshot; s != nil {
+		if !c.checkSnapshot(n, *s) {
+			return
+		}
+		n.snapshot, n.applied = s.LastIncludedIndex, s.LastIncludedIndex
+		n.log = append(slices.Clone(c.applied[:s.LastIncludedIndex]), restored.Entries...)
+	}
 	cfg, _ := raft.DefaultConfig()
 	cfg.ID = n.id
 	cfg.Peers = c.ids()
 	cfg.Rand = rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))
+	cfg.SnapshotChunkSize = c.snapshotChunkSize
 	n.core = raft.NewNode(cfg, restored)
 	n.boots++
 	n.status = n.core.Status()
-	n.log = restored.Entries
-	n.applied = 0
-	c.tracef("%s boot term=%d votedFor=%s lastIndex=%d tick=%s", name(n.id), restored.HardState.CurrentTerm,
-		name(restored.HardState.VotedFor), len(restored.Entries), ms(n.period))
+	c.tracef("%s boot term=%d votedFor=%s snapshot=%d lastIndex=%d tick=%s", name(n.id), restored.HardState.CurrentTerm,
+		name(restored.HardState.VotedFor), n.snapshot, len(n.log), ms(n.period))
 	c.tick(n, n.boots, c.now+c.randDuration(0, n.period))
 }
 
@@ -322,8 +348,10 @@ func (c *Cluster) tick(n *node, boot int, at time.Duration) {
 }
 
 // handleReady carries out n's Ready as the runtime does: it saves the hard
-// state and entries, then sends the messages, then applies the committed
-// entries. A crash during the Save takes n down with nothing sent.
+// state, snapshot, and entries, then sends the messages, then restores the
+// state machine from the snapshot if it is past what was applied, and
+// applies the committed entries. A crash during the Save takes n down
+// with nothing sent. Then n's service may take a snapshot.
 func (c *Cluster) handleReady(n *node) {
 	rd := n.core.Ready()
 	if err := n.storage.Save(rd); err != nil {
@@ -337,13 +365,52 @@ func (c *Cluster) handleReady(n *node) {
 	if rd.HardState != nil {
 		c.checkVote(n, *rd.HardState)
 	}
-	c.store(n, rd.Entries)
+	if rd.Snapshot != nil {
+		c.storeSnapshot(n, *rd.Snapshot, rd.Entries)
+	} else {
+		c.store(n, rd.Entries)
+	}
 	for _, m := range rd.Messages {
 		c.send(m)
+	}
+	if s := rd.Snapshot; s != nil && s.LastIncludedIndex > n.applied {
+		n.applied = s.LastIncludedIndex
+		c.tracef("%s install snapshot lastIncludedIndex=%d lastIncludedTerm=%d", name(n.id), s.LastIncludedIndex, s.LastIncludedTerm)
 	}
 	for _, e := range rd.CommittedEntries {
 		c.apply(n, e)
 	}
+	c.maybeCompact(n)
+}
+
+// maybeCompact has n's service snapshot its state machine, once it has
+// applied compactEvery entries past its latest snapshot (§7).
+func (c *Cluster) maybeCompact(n *node) {
+	if c.compactEvery == 0 || n.core == nil || n.applied < n.snapshot+raft.Index(c.compactEvery) {
+		return
+	}
+	if err := n.core.Compact(n.applied, c.stateAt(n.applied)); err != nil {
+		c.fail(fmt.Errorf("server %d: %w", n.id, err))
+		return
+	}
+	c.tracef("%s compact lastIncludedIndex=%d", name(n.id), n.applied)
+	c.handleReady(n)
+}
+
+// stateAt returns the state of a state machine that has applied the
+// first index entries: the JSON list of their commands. By State Machine
+// Safety, every server's state machine holds exactly this once it has
+// applied index entries.
+func (c *Cluster) stateAt(index raft.Index) []byte {
+	commands := make([]string, index)
+	for i, e := range c.applied[:index] {
+		commands[i] = string(e.Data)
+	}
+	data, err := json.Marshal(commands)
+	if err != nil {
+		panic("sim: encoding a list of strings failed: " + err.Error())
+	}
+	return data
 }
 
 // observe traces every change of role, term, or leader, and checks the

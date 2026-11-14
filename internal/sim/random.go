@@ -21,13 +21,21 @@ const (
 // under faults the seed chooses: partitions, one-way cuts, crashes,
 // restarts, and networks that lose, duplicate, and delay messages. All the
 // while, a client proposes commands to whichever servers believe they
-// lead. Then every fault heals, and within ten seconds the servers must
+// lead, and the servers compact their logs as often as every entry, or
+// never, and send snapshots whole or in small chunks, as the seed
+// chooses. Then every fault heals, and within ten seconds the servers must
 // agree on a leader, and within ten more apply a command proposed to it.
 // RunRandomized returns the cluster, whose trace tells what happened, and
 // the first violation or liveness failure. traceMessages adds every
 // message to the trace.
 func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
-	c := New(Options{Size: 1 + int(seed%5), Seed: seed, TraceMessages: traceMessages})
+	c := New(Options{
+		Size:              1 + int(seed%5),
+		Seed:              seed,
+		TraceMessages:     traceMessages,
+		CompactEvery:      []int{0, 1, 2, 4, 8}[seed/5%5],
+		SnapshotChunkSize: []int{0, 16, 128}[seed/25%3],
+	})
 	c.runClient()
 	for c.now < faultTime {
 		if err := c.RunFor(c.randDuration(50*time.Millisecond, time.Second)); err != nil {

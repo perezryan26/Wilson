@@ -109,6 +109,14 @@ func describe(m raft.Message) string {
 		}
 		return fmt.Sprintf("AppendEntriesResponse term=%d success=false conflictTerm=%d conflictIndex=%d",
 			r.Term, r.ConflictTerm, r.ConflictIndex)
+	case m.InstallSnapshot != nil:
+		r := m.InstallSnapshot
+		return fmt.Sprintf("InstallSnapshot term=%d leaderId=%d lastIncludedIndex=%d lastIncludedTerm=%d offset=%d bytes=%d done=%t",
+			r.Term, r.LeaderID, r.LastIncludedIndex, r.LastIncludedTerm, r.Offset, len(r.Data), r.Done)
+	case m.InstallSnapshotResponse != nil:
+		r := m.InstallSnapshotResponse
+		return fmt.Sprintf("InstallSnapshotResponse term=%d lastIncludedIndex=%d offset=%d done=%t",
+			r.Term, r.LastIncludedIndex, r.Offset, r.Done)
 	}
 	return "empty message"
 }
