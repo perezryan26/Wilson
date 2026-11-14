@@ -40,15 +40,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 		n.rejectAppend(req.LeaderID)
 		return
 	}
-	if n.role == Leader {
-		panic(fmt.Sprintf("raft: Election Safety violated: servers %d and %d both lead term %d",
-			n.id, req.LeaderID, n.currentTerm))
-	}
-	// The sender won this term's election, so a candidate concedes (§5.2),
-	// and hearing from the current leader restarts a follower's election
-	// timer (Figure 2, followers). The vote cast in this term stands.
-	n.becomeFollower(n.currentTerm, req.LeaderID)
-	n.resetElectionTimer()
+	n.followLeader(req.LeaderID)
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm (§5.3).
 	if term, ok := n.log.term(req.PrevLogIndex); !ok || term != req.PrevLogTerm {
@@ -71,6 +63,20 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 		Success:    true,
 		MatchIndex: lastNew,
 	}})
+}
+
+// followLeader makes the node a follower of leader, which sent a request
+// in the node's current term and so won this term's election: a
+// candidate concedes (§5.2), and hearing from the current leader restarts
+// a follower's election timer (Figure 2, followers). The vote cast in
+// this term stands.
+func (n *Node) followLeader(leader NodeID) {
+	if n.role == Leader {
+		panic(fmt.Sprintf("raft: Election Safety violated: servers %d and %d both lead term %d",
+			n.id, leader, n.currentTerm))
+	}
+	n.becomeFollower(n.currentTerm, leader)
+	n.resetElectionTimer()
 }
 
 func (n *Node) rejectAppend(to NodeID) {
@@ -109,16 +115,22 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 		n.sendAppend(from)
 		return
 	}
-	// A late or repeated reply acknowledges no more than one already
-	// counted, and matchIndex never moves back.
-	if resp.MatchIndex <= n.matchIndex[from] {
+	n.acknowledge(from, resp.MatchIndex)
+}
+
+// acknowledge records that server's log matches the leader's through
+// index (Figure 2, leaders: update nextIndex and matchIndex), and sends it
+// whatever it still lacks. A late or repeated reply acknowledges no more
+// than one already counted, and matchIndex never moves back.
+func (n *Node) acknowledge(server NodeID, index Index) {
+	if index <= n.matchIndex[server] {
 		return
 	}
-	n.matchIndex[from] = resp.MatchIndex
-	n.nextIndex[from] = resp.MatchIndex + 1
+	n.matchIndex[server] = index
+	n.nextIndex[server] = index + 1
 	n.maybeCommit()
-	if n.nextIndex[from] <= n.log.lastIndex() {
-		n.sendAppend(from)
+	if n.nextIndex[server] <= n.log.lastIndex() {
+		n.sendAppend(server)
 	}
 }
 
