@@ -21,13 +21,14 @@ const (
 // under faults the seed chooses: partitions, one-way cuts, crashes,
 // restarts, and networks that lose, duplicate, and delay messages. All the
 // while, a client proposes commands to whichever servers believe they
-// lead, and the servers compact their logs as often as every entry, or
-// never, and send snapshots whole or in small chunks, as the seed
-// chooses. Then every fault heals, and within ten seconds the servers must
-// agree on a leader, and within ten more apply a command proposed to it.
-// RunRandomized returns the cluster, whose trace tells what happened, and
-// the first violation or liveness failure. traceMessages adds every
-// message to the trace.
+// lead, in half the seeds pausing after each new leader, and the servers
+// compact their logs as often as every entry, or never, and send
+// snapshots whole or in small chunks, as the seed chooses. Then every
+// fault heals, and within ten seconds the servers must agree on a leader,
+// and within ten more apply a command proposed to it. RunRandomized
+// returns the cluster, whose trace tells what happened, and the first
+// violation or liveness failure. traceMessages adds every message to the
+// trace.
 func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 	c := New(Options{
 		Size:              1 + int(seed%5),
@@ -36,7 +37,7 @@ func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 		CompactEvery:      []int{0, 1, 2, 4, 8}[seed/5%5],
 		SnapshotChunkSize: []int{0, 16, 128}[seed/25%3],
 	})
-	c.runClient()
+	c.runClient(seed/75%2 == 1, 0)
 	for c.now < faultTime {
 		if err := c.RunFor(c.randDuration(50*time.Millisecond, time.Second)); err != nil {
 			return c, err
@@ -76,19 +77,32 @@ func (c *Cluster) checkLiveness() error {
 // runClient proposes a new command every 10 to 200 ms, for the rest of the
 // run, to a server that believes it leads, if any does. A stale leader
 // accepts commands that a later leader overwrites, which is the point.
-func (c *Cluster) runClient() {
+//
+// With idle set, the client first waits up to two seconds whenever a
+// leader of a term after seen appears. Until it proposes, the new leader
+// has no entry of its own term to commit, so entries of earlier terms
+// stay uncommitted on a majority, which Figure 8's hazard needs: a leader
+// that committed them by counting replicas could be followed by one that
+// overwrites them.
+func (c *Cluster) runClient(idle bool, seen raft.Term) {
 	c.schedule(c.now+c.randDuration(10*time.Millisecond, 200*time.Millisecond), func() {
 		var leaders []raft.NodeID
+		var term raft.Term
 		for _, id := range c.ids() {
 			if st, up := c.Status(id); up && st.Role == raft.Leader {
 				leaders = append(leaders, id)
+				term = max(term, st.Term)
 			}
+		}
+		if idle && term > seen {
+			c.schedule(c.now+c.randDuration(0, 2*time.Second), func() { c.runClient(idle, term) })
+			return
 		}
 		if len(leaders) > 0 {
 			// A server that believes it leads accepts the command.
 			_, _, _ = c.Propose(leaders[c.rng.IntN(len(leaders))], c.command())
 		}
-		c.runClient()
+		c.runClient(idle, max(seen, term))
 	})
 }
 
