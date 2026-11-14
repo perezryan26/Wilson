@@ -30,14 +30,19 @@ type Config struct {
 	HeartbeatTick int
 	// Rand draws election timeouts. Seeding it makes a run reproducible.
 	Rand *rand.Rand
+	// SnapshotChunkSize is the most snapshot bytes one InstallSnapshot
+	// carries (Figure 13's chunks). Zero sends the whole snapshot in one
+	// message.
+	SnapshotChunkSize int
 }
 
-// DefaultConfig returns the timing for a cluster on one local network: a
-// tick every 10 ms, a heartbeat every 5 ticks (50 ms), and election
-// timeouts drawn from [300 ms, 600 ms). The runtime calls Tick once per
-// returned interval, and the caller fills in ID, Peers, and Rand.
+// DefaultConfig returns the settings for a cluster on one local network:
+// a tick every 10 ms, a heartbeat every 5 ticks (50 ms), election
+// timeouts drawn from [300 ms, 600 ms), and snapshots sent in chunks of
+// 1 MiB. The runtime calls Tick once per returned interval, and the
+// caller fills in ID, Peers, and Rand.
 func DefaultConfig() (Config, time.Duration) {
-	return Config{ElectionTick: 30, HeartbeatTick: 5}, 10 * time.Millisecond
+	return Config{ElectionTick: 30, HeartbeatTick: 5, SnapshotChunkSize: 1 << 20}, 10 * time.Millisecond
 }
 
 // validate reports the first way c would break the algorithm. A server that
@@ -58,6 +63,8 @@ func (c Config) validate() error {
 			c.HeartbeatTick, c.ElectionTick)
 	case c.Rand == nil:
 		return errors.New("nil Rand")
+	case c.SnapshotChunkSize < 0:
+		return fmt.Errorf("negative SnapshotChunkSize %d", c.SnapshotChunkSize)
 	}
 	return nil
 }
@@ -111,11 +118,12 @@ type Status struct {
 // carries out the effects that Ready returns. It is not safe for
 // concurrent use.
 type Node struct {
-	id            NodeID
-	peers         []NodeID // every server, this one included, sorted
-	electionTick  int
-	heartbeatTick int
-	rand          *rand.Rand
+	id                NodeID
+	peers             []NodeID // every server, this one included, sorted
+	electionTick      int
+	heartbeatTick     int
+	rand              *rand.Rand
+	snapshotChunkSize int
 
 	// Persistent state on all servers (Figure 2), and the snapshot that
 	// replaced the log's earlier entries (§7), which a leader sends to
@@ -131,8 +139,14 @@ type Node struct {
 	lastApplied Index
 
 	// Volatile state on leaders, reinitialized after each election.
-	nextIndex  map[NodeID]Index // the next log index to send each server
-	matchIndex map[NodeID]Index // the highest index known replicated on each server
+	nextIndex      map[NodeID]Index // the next log index to send each server
+	matchIndex     map[NodeID]Index // the highest index known replicated on each server
+	snapshotOffset map[NodeID]int   // how many snapshot bytes each server is known to hold, while it is sent the snapshot
+
+	// The snapshot a follower is receiving in chunks (Figure 13, steps
+	// 2–4): the bytes so far, and the term of the leader sending them.
+	partial     *Snapshot
+	partialTerm Term
 
 	role   Role
 	leader NodeID          // see Status.Leader
@@ -161,16 +175,17 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 	}
 	hs := restored.HardState
 	n := &Node{
-		id:            cfg.ID,
-		peers:         slices.Sorted(slices.Values(cfg.Peers)),
-		electionTick:  cfg.ElectionTick,
-		heartbeatTick: cfg.HeartbeatTick,
-		rand:          cfg.Rand,
-		currentTerm:   hs.CurrentTerm,
-		votedFor:      hs.VotedFor,
-		log:           newLog(restored.Snapshot, restored.Entries),
-		snapshot:      restored.Snapshot,
-		prevHardState: hs,
+		id:                cfg.ID,
+		peers:             slices.Sorted(slices.Values(cfg.Peers)),
+		electionTick:      cfg.ElectionTick,
+		heartbeatTick:     cfg.HeartbeatTick,
+		rand:              cfg.Rand,
+		snapshotChunkSize: cfg.SnapshotChunkSize,
+		currentTerm:       hs.CurrentTerm,
+		votedFor:          hs.VotedFor,
+		log:               newLog(restored.Snapshot, restored.Entries),
+		snapshot:          restored.Snapshot,
+		prevHardState:     hs,
 	}
 	n.commitIndex = n.log.snapshotIndex()
 	n.lastApplied = n.commitIndex
@@ -261,6 +276,9 @@ func (n *Node) Compact(index Index, data []byte) error {
 	// step 6), and storage rewrites them after the snapshot.
 	n.log.restore(n.snapshot)
 	n.unstable = index + 1
+	// A leader sending the old snapshot starts the new one from its first
+	// byte.
+	clear(n.snapshotOffset)
 	return nil
 }
 
@@ -339,6 +357,7 @@ func (n *Node) becomeLeader() {
 	n.leader = n.id
 	n.nextIndex = map[NodeID]Index{}
 	n.matchIndex = map[NodeID]Index{}
+	n.snapshotOffset = map[NodeID]int{}
 	for _, id := range n.peers {
 		n.nextIndex[id] = n.log.lastIndex() + 1
 	}

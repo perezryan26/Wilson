@@ -21,8 +21,8 @@ func restoredFollower(term Term, s *Snapshot, log ...Term) *Node {
 	})
 }
 
-// installFrom returns an InstallSnapshot of s to server 1 from server 2,
-// leader of term.
+// installFrom returns an InstallSnapshot of all of s, in one chunk, to
+// server 1 from server 2, leader of term.
 func installFrom(term Term, s *Snapshot) Message {
 	return Message{From: 2, To: 1, InstallSnapshot: &InstallSnapshotRequest{
 		Term:              term,
@@ -30,6 +30,7 @@ func installFrom(term Term, s *Snapshot) Message {
 		LastIncludedIndex: s.LastIncludedIndex,
 		LastIncludedTerm:  s.LastIncludedTerm,
 		Data:              s.Data,
+		Done:              true,
 	}}
 }
 
@@ -115,7 +116,7 @@ func TestInstallSnapshotSavesSnapshot(t *testing.T) {
 	n.Step(installFrom(2, s))
 	rd := n.Ready()
 	wantSnapshot(t, rd, s)
-	if got := snapshotReply(t, rd); got != (InstallSnapshotResponse{Term: 2, LastIncludedIndex: 5}) {
+	if got := snapshotReply(t, rd); got != (InstallSnapshotResponse{Term: 2, LastIncludedIndex: 5, Done: true}) {
 		t.Errorf("reply = %+v, want an acknowledgment of the snapshot through 5", got)
 	}
 	if n.snapshot.LastIncludedIndex != 5 || n.log.snapshotIndex() != 5 {
@@ -184,7 +185,7 @@ func TestInstallSnapshotIgnoresCommittedPrefix(t *testing.T) {
 		n.Ready()
 		n.Step(installFrom(2, snapshotOf(index, 2)))
 		rd := n.Ready()
-		if got := snapshotReply(t, rd); got != (InstallSnapshotResponse{Term: 2, LastIncludedIndex: index}) {
+		if got := snapshotReply(t, rd); got != (InstallSnapshotResponse{Term: 2, LastIncludedIndex: index, Done: true}) {
 			t.Errorf("snapshot through %d: reply = %+v, want an acknowledgment", index, got)
 		}
 		if rd.Snapshot != nil || n.Status().LastApplied != 4 || n.log.snapshotIndex() != 0 || len(logTerms(n)) != 4 {
@@ -259,7 +260,7 @@ func rejectedBy(t *testing.T, n *Node, logEnd Index) Message {
 // snapshot replaced, the last included one among them, and AppendEntries
 // to one that needs only later entries.
 func TestLeaderSendsSnapshotWhenEntriesAreGone(t *testing.T) {
-	want := InstallSnapshotRequest{Term: 3, LeaderID: 1, LastIncludedIndex: 5, LastIncludedTerm: 1, Data: snapshotOf(5, 1).Data}
+	want := InstallSnapshotRequest{Term: 3, LeaderID: 1, LastIncludedIndex: 5, LastIncludedTerm: 1, Data: snapshotOf(5, 1).Data, Done: true}
 	for _, logEnd := range []Index{2, 4} {
 		got := rejectedBy(t, leaderWithSnapshot(t), logEnd).InstallSnapshot
 		if got == nil || fmt.Sprintf("%+v", *got) != fmt.Sprintf("%+v", want) {
@@ -287,7 +288,7 @@ func TestLeaderResendsSnapshotUntilAcknowledged(t *testing.T) {
 		}
 	}
 	n.Ready()
-	n.Step(Message{From: 2, To: 1, InstallSnapshotResponse: &InstallSnapshotResponse{Term: 3, LastIncludedIndex: 5}})
+	n.Step(Message{From: 2, To: 1, InstallSnapshotResponse: &InstallSnapshotResponse{Term: 3, LastIncludedIndex: 5, Done: true}})
 	req := oneAppend(t, n.Ready(), 2)
 	if req.PrevLogIndex != 5 || req.PrevLogTerm != 1 || len(req.Entries) != 2 {
 		t.Errorf("after the snapshot, sent %d entries after entry %d of term %d, want 2 after entry 5 of term 1",
@@ -359,7 +360,7 @@ func TestCompactReplacesAppliedEntries(t *testing.T) {
 		t.Errorf("status = %+v, want commitIndex and lastApplied unchanged at 5", st)
 	}
 	n.Step(Message{From: 3, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 1, ConflictIndex: 1}})
-	want := InstallSnapshotRequest{Term: 1, LeaderID: 1, LastIncludedIndex: 3, LastIncludedTerm: 1, Data: []byte("state@3")}
+	want := InstallSnapshotRequest{Term: 1, LeaderID: 1, LastIncludedIndex: 3, LastIncludedTerm: 1, Data: []byte("state@3"), Done: true}
 	sent := sentTo(n.Ready(), 3)
 	if len(sent) != 1 || sent[0].InstallSnapshot == nil || fmt.Sprintf("%+v", *sent[0].InstallSnapshot) != fmt.Sprintf("%+v", want) {
 		t.Errorf("sent server 3 %+v, want InstallSnapshot %+v", sent, want)
@@ -391,4 +392,190 @@ func TestCompactRefusesUnappliedOrCompactedIndex(t *testing.T) {
 	if rd := n.Ready(); rd.Snapshot != nil || n.log.snapshotIndex() != 3 {
 		t.Errorf("refused compactions left Ready snapshot %+v and a snapshot through %d", rd.Snapshot, n.log.snapshotIndex())
 	}
+}
+
+// chunkFrom returns a chunk of snapshotOf(index, 2), whose data is
+// "state@<index>", to server 1 from server 2, leader of term: the data at
+// offset, the last chunk if done.
+func chunkFrom(term Term, index Index, offset int, data string, done bool) Message {
+	return Message{From: 2, To: 1, InstallSnapshot: &InstallSnapshotRequest{
+		Term:              term,
+		LeaderID:          2,
+		LastIncludedIndex: index,
+		LastIncludedTerm:  2,
+		Offset:            offset,
+		Data:              []byte(data),
+		Done:              done,
+	}}
+}
+
+// Figure 13, receiver steps 2 to 4: the first chunk starts a new
+// snapshot, each chunk is written at its offset, and until the last one
+// the follower replies with how much it holds and waits. The last chunk
+// completes the snapshot, which is installed.
+func TestInstallSnapshotAssemblesChunks(t *testing.T) {
+	n := newFollower(2, 1)
+	for _, c := range []struct {
+		offset int
+		data   string
+	}{{0, "sta"}, {3, "te@"}} {
+		n.Step(chunkFrom(2, 5, c.offset, c.data, false))
+		rd := n.Ready()
+		want := InstallSnapshotResponse{Term: 2, LastIncludedIndex: 5, Offset: c.offset + len(c.data)}
+		if got := snapshotReply(t, rd); got != want || rd.Snapshot != nil {
+			t.Fatalf("chunk at %d: reply %+v and Ready snapshot %+v, want %+v and none", c.offset, got, rd.Snapshot, want)
+		}
+	}
+	n.Step(chunkFrom(2, 5, 6, "5", true))
+	rd := n.Ready()
+	wantSnapshot(t, rd, snapshotOf(5, 2))
+	if got := snapshotReply(t, rd); got != (InstallSnapshotResponse{Term: 2, LastIncludedIndex: 5, Done: true}) {
+		t.Errorf("last chunk: reply = %+v, want done", got)
+	}
+}
+
+// Figure 13, receiver step 3: the leader sends each chunk once the one
+// before is acknowledged, so a chunk that does not continue the snapshot
+// arriving is a repeat or comes from an earlier transfer. It is dropped,
+// and the reply says how much of its snapshot the follower holds. A first
+// chunk from the leader of a later term starts over (step 2).
+func TestInstallSnapshotDropsChunksThatDoNotContinue(t *testing.T) {
+	n := newFollower(2, 1)
+	for _, step := range []struct {
+		name   string
+		msg    Message
+		holds  int
+		latest Term
+	}{
+		{"a chunk past what arrived", chunkFrom(2, 5, 3, "te@", false), 0, 2},
+		{"the first chunk", chunkFrom(2, 5, 0, "sta", false), 3, 2},
+		{"the second chunk", chunkFrom(2, 5, 3, "te@", false), 6, 2},
+		{"the first chunk again", chunkFrom(2, 5, 0, "sta", false), 6, 2},
+		{"the second chunk again", chunkFrom(2, 5, 3, "te@", false), 6, 2},
+		{"a chunk of another snapshot", chunkFrom(2, 7, 6, "7", true), 0, 2},
+		{"a first chunk from a later leader", chunkFrom(3, 5, 0, "sta", false), 3, 3},
+	} {
+		n.Step(step.msg)
+		rd := n.Ready()
+		if got := snapshotReply(t, rd); got.Offset != step.holds || got.Done || got.Term != step.latest || rd.Snapshot != nil {
+			t.Fatalf("%s: reply %+v and Ready snapshot %+v, want %d bytes held in term %d", step.name, got, rd.Snapshot, step.holds, step.latest)
+		}
+	}
+	n.Step(chunkFrom(3, 5, 3, "te@", false))
+	n.Step(chunkFrom(3, 5, 6, "5", true))
+	wantSnapshot(t, n.Ready(), snapshotOf(5, 2))
+}
+
+// transfer delivers messages between leader n and follower f, in send
+// order, until none are left, dropping those to anyone else, and returns
+// the snapshot chunks f received.
+func transfer(t *testing.T, n, f *Node) []InstallSnapshotRequest {
+	t.Helper()
+	var chunks []InstallSnapshotRequest
+	queue := append(n.Ready().Messages, f.Ready().Messages...)
+	for len(queue) > 0 {
+		if len(chunks) > 100 {
+			t.Fatal("more than 100 chunks sent")
+		}
+		m := queue[0]
+		queue = queue[1:]
+		to := map[NodeID]*Node{n.id: n, f.id: f}[m.To]
+		if to == nil {
+			continue
+		}
+		if m.InstallSnapshot != nil {
+			chunks = append(chunks, *m.InstallSnapshot)
+		}
+		to.Step(m)
+		queue = append(queue, to.Ready().Messages...)
+	}
+	return chunks
+}
+
+// Figure 13's chunking: SnapshotChunkSize bounds each chunk, so the
+// 7-byte snapshot "state@5" takes one message when the size is 0 or at
+// least 7, and more otherwise, and arrives whole either way. The follower
+// then takes the entries after it.
+func TestSnapshotTravelsInChunks(t *testing.T) {
+	for size, want := range map[int]int{0: 1, 3: 3, 6: 2, 7: 1, 100: 1} {
+		n := leaderWithSnapshot(t)
+		n.snapshotChunkSize = size
+		f := NewNode(testConfig(2, 3, 1), RestoredState{})
+		for range n.heartbeatTick {
+			n.Tick()
+		}
+		chunks := transfer(t, n, f)
+		if len(chunks) != want || !chunks[len(chunks)-1].Done {
+			t.Errorf("chunk size %d: sent %d chunks, the last done: %t; want %d", size, len(chunks), len(chunks) > 0 && chunks[len(chunks)-1].Done, want)
+		}
+		if f.snapshot == nil || string(f.snapshot.Data) != "state@5" || len(logTerms(f)) != 2 {
+			t.Errorf("chunk size %d: follower has snapshot %+v and log terms %v, want state@5 and two entries", size, f.snapshot, logTerms(f))
+		}
+	}
+}
+
+// progressFrom returns server 2's reply to a chunk of the snapshot
+// through index, saying it holds offset bytes of it.
+func progressFrom(index Index, offset int) Message {
+	return Message{From: 2, To: 1, InstallSnapshotResponse: &InstallSnapshotResponse{Term: 3, LastIncludedIndex: index, Offset: offset}}
+}
+
+// wantChunk checks that rd sends server 2 just the chunk of the snapshot
+// through index that begins at offset, or nothing if offset is negative.
+func wantChunk(t *testing.T, what string, rd Ready, index Index, offset int) {
+	t.Helper()
+	sent := sentTo(rd, 2)
+	switch {
+	case offset < 0 && len(sent) != 0:
+		t.Errorf("%s: sent %+v, want nothing", what, sent)
+	case offset >= 0 && (len(sent) != 1 || sent[0].InstallSnapshot == nil ||
+		sent[0].InstallSnapshot.LastIncludedIndex != index || sent[0].InstallSnapshot.Offset != offset):
+		t.Errorf("%s: sent %+v, want the chunk at %d of the snapshot through %d", what, sent, offset, index)
+	}
+}
+
+// The leader sends the next chunk as soon as a reply shows the follower
+// took the last one. A reply that does not, a repeat or one from a
+// follower that lost what it held, waits for the next heartbeat to resend
+// from where the follower is, so duplicated replies never start a second
+// stream of chunks. Compacting again starts the transfer of the new
+// snapshot from its first byte.
+func TestLeaderSendsNextChunkOnProgress(t *testing.T) {
+	n := leaderWithSnapshot(t)
+	n.snapshotChunkSize = 3
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: 1}})
+	wantChunk(t, "after the rejection", n.Ready(), 5, 0)
+	n.Step(progressFrom(5, 3))
+	wantChunk(t, "after progress", n.Ready(), 5, 3)
+	for _, reply := range []struct {
+		name string
+		msg  Message
+	}{
+		{"a repeated reply", progressFrom(5, 3)},
+		{"a reply about another snapshot", progressFrom(4, 6)},
+		{"a follower that lost what it received", progressFrom(5, 0)},
+	} {
+		n.Step(reply.msg)
+		wantChunk(t, "after "+reply.name, n.Ready(), 5, -1)
+	}
+	for range n.heartbeatTick {
+		n.Tick()
+	}
+	wantChunk(t, "at the heartbeat", n.Ready(), 5, 0)
+	// Server 3 acknowledges entries 6 and 7 and a new one, which commits
+	// them all, and the leader compacts them.
+	if _, _, err := n.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	n.Step(progressFrom(5, 3))
+	n.Step(appendResponse(3, 3, true, 8))
+	n.Ready()
+	if err := n.Compact(8, []byte("state@8")); err != nil {
+		t.Fatal(err)
+	}
+	n.Ready()
+	for range n.heartbeatTick {
+		n.Tick()
+	}
+	wantChunk(t, "after compacting again", n.Ready(), 8, 0)
 }

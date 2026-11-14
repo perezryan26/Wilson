@@ -136,18 +136,26 @@ type InstallSnapshotRequest struct {
 	LeaderID          NodeID // so the follower can redirect clients
 	LastIncludedIndex Index  // the snapshot replaces all entries up through and including this index
 	LastIncludedTerm  Term   // term of LastIncludedIndex
-	Data              []byte // the snapshot's state machine state
+	Offset            int    // byte offset where the chunk is positioned in the snapshot
+	Data              []byte // raw bytes of the snapshot chunk, starting at Offset
+	Done              bool   // true if this is the last chunk
 }
 
 // InstallSnapshotResponse holds the results of the InstallSnapshot RPC.
+// Beyond Figure 13's term, it says what it acknowledges, because replies
+// can arrive late, twice, or out of order.
 type InstallSnapshotResponse struct {
 	Term Term // currentTerm, for the leader to update itself
 
-	// LastIncludedIndex names the snapshot the reply answers: the
-	// follower's log now matches the leader's through it. The reply says
-	// what it acknowledges because replies can arrive late, twice, or out
-	// of order.
+	// LastIncludedIndex names the snapshot the reply answers.
 	LastIncludedIndex Index
+	// Offset, until Done, is how many of the snapshot's bytes the
+	// follower holds: where the next chunk must begin.
+	Offset int
+	// Done is true once the follower's log matches the leader's through
+	// LastIncludedIndex, because it installed the snapshot or already had
+	// every entry it covers.
+	Done bool
 }
 
 // Ready holds the effects a node produced since the previous call to

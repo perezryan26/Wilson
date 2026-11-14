@@ -138,6 +138,7 @@ func TestNewNodeRejectsInvalidConfig(t *testing.T) {
 		{"no heartbeat interval", func(c *Config) { c.HeartbeatTick = 0 }},
 		{"heartbeat as long as the election timeout", func(c *Config) { c.HeartbeatTick = c.ElectionTick }},
 		{"nil Rand", func(c *Config) { c.Rand = nil }},
+		{"negative snapshot chunk size", func(c *Config) { c.SnapshotChunkSize = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
