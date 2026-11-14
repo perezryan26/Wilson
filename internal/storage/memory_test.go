@@ -68,3 +68,40 @@ func TestMemoryAppendsAndTruncatesEntries(t *testing.T) {
 		t.Error("changing loaded entries changed the stored log")
 	}
 }
+
+// A snapshot replaces the whole stored log, and the entries saved with it
+// follow it; later entries append and truncate after it as before. An
+// older snapshot, or entries inside the snapshot, are refused and change
+// nothing.
+func TestMemoryKeepsSnapshotAndEntriesAfterIt(t *testing.T) {
+	var m Memory
+	e := func(index raft.Index, term raft.Term) raft.Entry { return raft.Entry{Index: index, Term: term} }
+	snap := func(index raft.Index) *raft.Snapshot {
+		return &raft.Snapshot{LastIncludedIndex: index, LastIncludedTerm: 1, Data: []byte{byte(index)}}
+	}
+	steps := []struct {
+		save     raft.Ready
+		ok       bool
+		snapshot raft.Index
+		want     []raft.Entry
+	}{
+		{raft.Ready{Entries: []raft.Entry{e(1, 1), e(2, 1), e(3, 1), e(4, 1)}}, true, 0, []raft.Entry{e(1, 1), e(2, 1), e(3, 1), e(4, 1)}},
+		{raft.Ready{Snapshot: snap(2), Entries: []raft.Entry{e(3, 1), e(4, 1)}}, true, 2, []raft.Entry{e(3, 1), e(4, 1)}},
+		{raft.Ready{Entries: []raft.Entry{e(4, 2), e(5, 2)}}, true, 2, []raft.Entry{e(3, 1), e(4, 2), e(5, 2)}},
+		{raft.Ready{Snapshot: snap(6)}, true, 6, nil},
+		{raft.Ready{Entries: []raft.Entry{e(7, 2)}}, true, 6, []raft.Entry{e(7, 2)}},
+		{raft.Ready{Snapshot: snap(6)}, false, 6, []raft.Entry{e(7, 2)}},
+		{raft.Ready{Entries: []raft.Entry{e(6, 2)}}, false, 6, []raft.Entry{e(7, 2)}},
+		{raft.Ready{Snapshot: snap(9), Entries: []raft.Entry{e(11, 2)}}, false, 6, []raft.Entry{e(7, 2)}},
+	}
+	for i, step := range steps {
+		if err := m.Save(step.save); (err == nil) != step.ok {
+			t.Fatalf("step %d: Save error = %v, want success %t", i, err, step.ok)
+		}
+		got := load(t, &m)
+		if snapshotIndex(got.Snapshot) != step.snapshot ||
+			!slices.EqualFunc(got.Entries, step.want, func(a, b raft.Entry) bool { return a.Index == b.Index && a.Term == b.Term }) {
+			t.Errorf("step %d: loaded snapshot %+v and entries %v, want the snapshot through %d and %v", i, got.Snapshot, got.Entries, step.snapshot, step.want)
+		}
+	}
+}

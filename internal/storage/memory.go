@@ -12,22 +12,35 @@ import (
 // outlives the process.
 type Memory struct {
 	hardState raft.HardState
-	entries   []raft.Entry // the log, from index 1
+	snapshot  *raft.Snapshot // the latest snapshot, or nil
+	entries   []raft.Entry   // the log after the snapshot
 }
 
 // Save persists what rd holds for stable storage. The runtime calls it, and
-// it must return, before any of rd's messages are sent. Entries replace any
-// stored entries from rd.Entries[0].Index on. Save fails, changing nothing,
-// only if the entries would leave a gap in the log, which no correct node
-// asks for.
+// it must return, before any of rd's messages are sent. A snapshot, with
+// the entries that follow it, replaces the whole stored log; otherwise
+// entries replace any stored entries from rd.Entries[0].Index on. Save
+// fails, changing nothing, only for what no correct node asks: entries
+// that would leave a gap in the log, or a snapshot no newer than the
+// stored one.
 func (m *Memory) Save(rd raft.Ready) error {
-	if len(rd.Entries) > 0 {
-		first := rd.Entries[0].Index
-		if first < 1 || first > raft.Index(len(m.entries))+1 {
-			return fmt.Errorf("storage: entries start at index %d, but the log ends at index %d", first, len(m.entries))
+	snap, entries := m.snapshot, m.entries
+	if rd.Snapshot != nil {
+		if rd.Snapshot.LastIncludedIndex <= snapshotIndex(snap) {
+			return fmt.Errorf("storage: a snapshot through index %d is no newer than the stored one through %d",
+				rd.Snapshot.LastIncludedIndex, snapshotIndex(snap))
 		}
-		m.entries = append(m.entries[:first-1], rd.Entries...)
+		s := *rd.Snapshot
+		snap, entries = &s, nil
 	}
+	if len(rd.Entries) > 0 {
+		base, first := snapshotIndex(snap), rd.Entries[0].Index
+		if first <= base || first > base+raft.Index(len(entries))+1 {
+			return fmt.Errorf("storage: entries start at index %d, but the log runs from %d to %d", first, base+1, base+raft.Index(len(entries)))
+		}
+		entries = append(entries[:first-base-1], rd.Entries...)
+	}
+	m.snapshot, m.entries = snap, entries
 	if rd.HardState != nil {
 		m.hardState = *rd.HardState
 	}
@@ -37,5 +50,13 @@ func (m *Memory) Save(rd raft.Ready) error {
 // Load returns the state to restart a node from: everything saved so far.
 // The entries are a copy, so the node cannot change what is stored.
 func (m *Memory) Load() (raft.RestoredState, error) {
-	return raft.RestoredState{HardState: m.hardState, Entries: slices.Clone(m.entries)}, nil
+	return raft.RestoredState{HardState: m.hardState, Snapshot: m.snapshot, Entries: slices.Clone(m.entries)}, nil
+}
+
+// snapshotIndex returns the last index s includes, or 0 if s is nil.
+func snapshotIndex(s *raft.Snapshot) raft.Index {
+	if s == nil {
+		return 0
+	}
+	return s.LastIncludedIndex
 }
