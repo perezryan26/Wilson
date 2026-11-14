@@ -9,20 +9,22 @@ func NewNode(cfg Config, restored RestoredState) *Node
 func (n *Node) Tick()                                   // advance one logical clock tick
 func (n *Node) Step(m Message)                          // handle an inbound RPC request or response
 func (n *Node) Propose(cmd []byte) (Index, Term, error) // append a command on the leader
+func (n *Node) Compact(index Index, data []byte) error  // replace the log through index with a snapshot
 func (n *Node) Ready() Ready                            // effects produced since the last call
 func (n *Node) Status() Status                          // read-only role, term, leader, commitIndex, lastApplied
 ```
 
-After every `Tick`, `Step`, or `Propose`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
+After every `Tick`, `Step`, `Propose`, or `Compact`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
 
-1. **Persist.** Save `HardState`, when it is not nil, and `Entries` to stable storage, then fsync. When `Entries[0].Index` is at or below the last stored index, first discard every stored entry from that index on: the server is overwriting a conflicting suffix. A storage error stops the process, because after a failed fsync the state on disk is unknown.
+1. **Persist.** Save `HardState`, when it is not nil, `Snapshot`, and `Entries` to stable storage, then fsync. A snapshot and the entries saved with it, which are then every entry after it, replace the whole stored log. Otherwise, when `Entries[0].Index` is at or below the last stored index, first discard every stored entry from that index on: the server is overwriting a conflicting suffix. A storage error stops the process, because after a failed fsync the state on disk is unknown.
 2. **Send.** Deliver `Messages`.
-3. **Apply.** Apply `CommittedEntries` to the state machine, in index order.
+3. **Apply.** If `Snapshot` is past the last entry the state machine applied, restore the state machine from it. Then apply `CommittedEntries` to the state machine, in index order.
 
 | Field | Holds | Step |
 | --- | --- | --- |
 | `HardState *HardState` | `currentTerm` and `votedFor`, when either changed since the last `Ready`; nil otherwise | 1 |
-| `Entries []Entry` | Log entries not yet handed to storage, in index order | 1 |
+| `Snapshot *Snapshot` | A snapshot that `Compact` took or the leader sent, with `LastIncludedIndex`, `LastIncludedTerm`, and the state machine's `Data`; nil otherwise | 1, and 3 if it is past what was applied |
+| `Entries []Entry` | Log entries not yet handed to storage, in index order; with a snapshot, every entry after it | 1 |
 | `Messages []Message` | RPC requests and responses to send | 2 |
 | `CommittedEntries []Entry` | Entries committed since the last `Ready`, in index order, each released once per boot | 3 |
 
@@ -30,9 +32,11 @@ Persisting before sending is how Figure 2's rule, that persistent state is updat
 
 Persisting before applying means no entry reaches the state machine before it is on this server's disk. It is also why a leader may count its own entries toward a majority before they are fsynced: the commit becomes visible, as a `LeaderCommit` in a message or an applied entry, only after the `Ready` holding those entries was persisted.
 
-`Ready` drains: it returns everything produced since the previous call and clears it. There is no acknowledgment call, because the runtime finishes one `Ready` before it calls the core again. `Entries` and `CommittedEntries`, like the entries inside messages, are copies, so nothing the core does later can change them.
+A snapshot from the leader is always past everything the state machine applied, and one from `Compact` never is, so step 3's test tells them apart: the first resets the state machine (Figure 13, step 8), and the second is the state machine's own state.
 
-This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, including the snapshot that `Ready` gains with log compaction.
+`Ready` drains: it returns everything produced since the previous call and clears it. There is no acknowledgment call, because the runtime finishes one `Ready` before it calls the core again. `Entries` and `CommittedEntries`, like the entries inside messages, are copies, so nothing the core does later can change them. A snapshot's data is shared, and no one modifies it.
+
+This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, and [ADR-0005](adr/0005-snapshot-format.md) the snapshots.
 
 ## Driving the core
 
@@ -46,19 +50,26 @@ for each input, a tick or an inbound message {
 	for _, m := range rd.Messages {
 		transport.Send(m)
 	}
+	if rd.Snapshot != nil && rd.Snapshot.LastIncludedIndex > stateMachine.Applied() {
+		stateMachine.Restore(rd.Snapshot.Data)
+	}
 	for _, e := range rd.CommittedEntries {
 		stateMachine.Apply(e)
+	}
+	if the log has grown enough since the last snapshot {
+		node.Compact(stateMachine.Applied(), stateMachine.Snapshot())
+		// and handle the Ready that follows, as above
 	}
 }
 ```
 
-Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). The runtime in `node/` is not written yet.
+Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). Its servers compact their logs, and its state machine is the list of commands applied. The runtime in `node/` is not written yet.
 
-`NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote and that log. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at 0, relearns what is committed from the leader, and applies its log again from the start.
+`NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote, that snapshot, and the log after it. The runtime restores the state machine from the snapshot first. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at the snapshot's last included index, or at 0 with no snapshot, relearns what is committed from the leader, and applies its log again from there.
 
 ## Storage
 
-The runtime persists through the `Storage` interface in [`internal/storage`](../internal/storage): `Save(Ready)` returns once the `Ready`'s hard state and entries are durable, and `Load` returns what a server restarts from. `Memory` keeps both in memory, for tests. `FileStorage` keeps them in a write-ahead log (WAL) on disk, with a copy in memory for `Load`; [ADR-0003](adr/0003-wal-format.md) records why the format is what it is.
+The runtime persists through the `Storage` interface in [`internal/storage`](../internal/storage): `Save(Ready)` returns once the `Ready`'s hard state, snapshot, and entries are durable, and `Load` returns what a server restarts from. `Memory` keeps them in memory, for tests. `FileStorage` keeps the hard state and log in a write-ahead log (WAL) on disk and the snapshot in a file of its own, with a copy of all three in memory for `Load`; [ADR-0003](adr/0003-wal-format.md) and [ADR-0005](adr/0005-snapshot-format.md) record why the formats are what they are.
 
 ### Records
 
@@ -76,8 +87,9 @@ The WAL is a sequence of records. Every number in one is little-endian.
 | 1 | Hard state | `currentTerm u64`, `votedFor u64` (0 for none): 16 bytes |
 | 2 | Entry | `index u64`, `term u64`, an entry type byte (0, a normal entry), then the command, to the end of the record: 17 bytes plus the command |
 | 3 | Truncation | `index u64`, the first of the stored entries to discard, all the rest with it: 8 bytes |
+| 4 | Snapshot | `currentTerm u64`, `votedFor u64`, then the snapshot's `lastIncludedIndex u64` and `lastIncludedTerm u64`: 32 bytes. Valid only as the first record of a segment, which it makes the start of the log |
 
-Type 0 and every type above 3 are invalid. So is an entry type byte other than 0, until the election no-op and configuration entries arrive. Here are three records byte by byte, in hex: the hard state of term 3 with a vote for server 2, entry 7 of term 3 with the command `x=1`, and a truncation from index 5. `TestRecordBytes` checks that the encoder produces exactly these.
+Type 0 and every type above 4 are invalid. So is an entry type byte other than 0, until the election no-op and configuration entries arrive. Here are four records byte by byte, in hex: the hard state of term 3 with a vote for server 2, entry 7 of term 3 with the command `x=1`, a truncation from index 5, and a snapshot record with that hard state for a snapshot through index 7 of term 3. `TestRecordBytes` checks that the encoder produces exactly these.
 
 ```text
 length       crc32c       type  payload
@@ -89,6 +101,29 @@ length       crc32c       type  payload
 
 09 00 00 00  c0 9b 6b ca  03    05 00 00 00 00 00 00 00
                                 index 5
+
+21 00 00 00  75 4c 76 cf  04    03 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  07 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00
+                                currentTerm 3            votedFor 2               lastIncludedIndex 7      lastIncludedTerm 3
+```
+
+### Snapshot files
+
+A snapshot is saved in a file of its own in the WAL's directory, named after its last included index in 16 lowercase hex digits, such as `0000000000000007.snap`. Every number is little-endian.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | `crc32c`: the CRC-32C checksum of everything after it |
+| 4 | 8 | `lastIncludedIndex` |
+| 12 | 8 | `lastIncludedTerm` |
+| 20 | 4 | `config length`: the size of the cluster configuration, 0 until membership changes define one |
+| 24 | `config length` | `config` |
+| 24 + `config length` | the rest of the file | `data`: the state machine's state, as the service encoded it |
+
+Here is the snapshot through index 7 of term 3 whose data is `{"x":"1"}`, byte by byte. `TestSnapshotBytes` checks it.
+
+```text
+crc32c       lastIncludedIndex 7      lastIncludedTerm 3       config length 0  data
+7a f9 f7 c0  07 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00  00 00 00 00      7b 22 78 22 3a 22 31 22 7d
 ```
 
 ### Segments and saves
@@ -98,16 +133,26 @@ length       crc32c       type  payload
 - Before a write, a segment that has reached the size limit (64 MiB by default) is closed and the next one is created. The directory is fsynced before any record goes into the new file, or a crash could make the file vanish with its records.
 - After a write or fsync fails, every later `Save` fails too: what the disk holds is unknown, and the runtime must stop.
 
+### Saving a snapshot
+
+A `Ready` with a snapshot replaces the whole stored log, so `Save` starts the WAL over instead of appending to it:
+
+1. It writes the snapshot file.
+2. It writes a new segment, named after the next record's sequence number: a snapshot record with the hard state and the snapshot's last included index and term, then an entry record for each entry after the snapshot.
+3. It removes every segment before the new one, and every other snapshot file.
+
+Steps 1 and 2 each write a temporary file ending in `.tmp`, fsync it, rename it into place, and fsync the directory, so each file appears whole or not at all. A crash before the new segment's rename leaves the old state, and one after it leaves the new one; recovery cleans up after either. The entries after the snapshot are written again, so recovery never needs a segment from before the snapshot.
+
 ### Recovery
 
-`OpenFileStorage` replays every segment in order, and each segment must begin with the record after the previous segment's last.
+`OpenFileStorage` replays the log from the newest segment that begins with a snapshot record, or from segment 0 if none does, and each segment must begin with the record after the previous segment's last. A snapshot record loads the snapshot file it names, which must exist and hold the same index and term. Recovery then removes what a crash or a newer snapshot left behind: segments before the one it started from, which it never reads, other snapshot files, and `.tmp` files.
 
 - **Torn final record.** In the last segment, a record that runs past the end of the file, its header or its body cut short, is a write torn by a crash, which no `Save` returned for. Recovery truncates the file where the record begins, fsyncs, and logs the segment, offset, and bytes dropped.
-- **Corruption.** Anything else refuses to start with an error wrapping `ErrCorrupt` that names the segment and offset: a checksum mismatch, an empty or malformed record, an entry that is not the next index, a truncation outside the log, a record cut short in an earlier segment, or a segment missing from the sequence. Starting anyway could forget a vote or an acknowledged entry.
+- **Corruption.** Anything else refuses to start with an error wrapping `ErrCorrupt` that names the segment and offset: a checksum mismatch, an empty or malformed record, an entry that is not the next index, a truncation outside the log, a snapshot record anywhere but at the start of the log, a snapshot file missing, damaged, or holding another snapshot, a record cut short in an earlier segment, or a segment missing from the sequence. Starting anyway could forget a vote or an acknowledged entry.
 
 ### File systems
 
-`FileStorage` reaches the disk only through `FS`: `OpenFile`, `ReadDir`, and `SyncDir`, with a `File` that reads, writes, syncs, truncates, and closes. `OSFS` is the operating system's file system. `FaultFS` lives in memory and crashes on demand, at once or during the nth write, truncation, file creation, or fsync. A crash keeps everything synced and a random prefix of the rest, as a power failure would: of each file's writes and truncations since its last fsync, the last write possibly cut mid-record, and of the files created since their directory's last fsync. Crash tests and the simulator run file storage on it.
+`FileStorage` reaches the disk only through `FS`: `OpenFile`, `ReadDir`, `Rename`, `Remove`, and `SyncDir`, with a `File` that reads, writes, syncs, truncates, and closes. `OSFS` is the operating system's file system. `FaultFS` lives in memory and crashes on demand, at once or during the nth write, truncation, file creation, rename, removal, or fsync. A crash keeps everything synced and a random prefix of the rest, as a power failure would: of each file's writes and truncations since its last fsync, the last write possibly cut mid-record, and of the creations, renames, and removals since their directory's last fsync. Crash tests and the simulator run file storage on it.
 
 ## Log replication
 
@@ -119,6 +164,16 @@ The log (`raftLog`) holds a sentinel entry at index 0 of term 0 ahead of the rea
 - **Replies.** A success names what it acknowledges, `MatchIndex = PrevLogIndex + len(Entries)`, because replies arrive late, twice, or out of order. `matchIndex` only moves forward. A rejection names where the logs part, and the leader skips a whole conflicting term per round trip ([ADR-0004](adr/0004-fast-log-backtracking.md)).
 - **Commitment.** The leader commits the highest index a majority stores, counting its own log, but only if that entry is from its current term (§5.4.2, Figure 8); earlier entries then commit with it.
 
+## Log compaction
+
+Each server snapshots its own state machine (§7), and a leader sends its snapshot to followers that need entries it has discarded ([ADR-0005](adr/0005-snapshot-format.md)).
+
+- **The log after a snapshot.** The log's sentinel stands for the snapshot's last included entry, so the log keeps that entry's index and term, and the term of the entry before its first is always known. The entries the snapshot replaced have no term any more.
+- **Compacting.** Once the state machine has applied an index, the service calls `Compact(index, data)` with its state as of that index. The log drops the entries through it and keeps the rest. The next `Ready` hands storage the snapshot and every entry after it, which replace the stored log.
+- **Sending.** When a follower's `nextIndex` is at or below the snapshot's last included index, the next entry it needs is gone, so the leader sends InstallSnapshot in place of AppendEntries. A chunk holds at most `SnapshotChunkSize` bytes (0 for the whole snapshot) and starts where the follower's copy is known to end. The leader resends it at every heartbeat, and sends the next chunk as soon as a reply shows progress. A transfer keeps the snapshot it began with, even if the leader compacts again, and its last reply counts as a successful AppendEntries through the snapshot's last included index.
+- **Receiving.** The follower follows Figure 13. A snapshot at or below `commitIndex` adds nothing, so the follower ignores it and replies that its log already covers it. Otherwise it assembles the chunks in memory, keeps the entries after a matching last included entry (step 6) or discards its log (step 7), and resets its state machine (step 8) by moving `commitIndex` and `lastApplied` to the snapshot's last included index and handing the snapshot to the runtime. InstallSnapshot restarts the election timer, as AppendEntries does.
+- **AppendEntries inside a snapshot.** A request whose `PrevLogIndex` comes before the snapshot's last included entry matches there: the entries the snapshot replaced are committed, so they match every leader's. Only the request's entries after the snapshot reach the log.
+
 ## Time
 
 The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)).
@@ -129,7 +184,7 @@ The core counts time in ticks and never sees a duration. `DefaultConfig` returns
 
 ## Messages
 
-A `Message` names its sender and receiver and carries exactly one RPC, as a pointer to a struct named after the paper with Figure 2's fields: `RequestVoteRequest`, `RequestVoteResponse`, `AppendEntriesRequest`, and `AppendEntriesResponse`. A response is a message of its own, not a return value, so it can wait in a `Ready` until the state it reflects is durable.
+A `Message` names its sender and receiver and carries exactly one RPC, as a pointer to a struct named after the paper with Figure 2's or Figure 13's fields: `RequestVoteRequest`, `RequestVoteResponse`, `AppendEntriesRequest`, `AppendEntriesResponse`, `InstallSnapshotRequest`, and `InstallSnapshotResponse`. A response is a message of its own, not a return value, so it can wait in a `Ready` until the state it reflects is durable. Because replies can arrive late, twice, or out of order, the AppendEntries and InstallSnapshot replies add fields that say what they acknowledge ([ADR-0004](adr/0004-fast-log-backtracking.md), [ADR-0005](adr/0005-snapshot-format.md)).
 
 `Step` applies Figure 2's rule for all servers before any handler runs: a request or response from a later term moves the server to that term as a follower. Each handler can then assume the message's term is at most `currentTerm`.
 
@@ -145,7 +200,7 @@ A server is a follower, a candidate, or a leader (§5.1). Roles change only in `
 | candidate | follower | it hears AppendEntries from a leader of its term or later, or any message from a later term |
 | leader | follower | it hears any message from a later term |
 
-A leader that hears an AppendEntries from another leader of its own term panics: two leaders in one term means Election Safety is already broken.
+A leader that hears an AppendEntries or InstallSnapshot from another leader of its own term panics: two leaders in one term means Election Safety is already broken.
 
 ## Determinism
 
@@ -158,11 +213,12 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 
 | File | Contents |
 | --- | --- |
-| [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `HardState`, `Message` and the RPC structs, `Ready` |
-| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Ready`, `Status`, and the three `become*` functions |
-| [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, and the merge that carries out AppendEntries steps 3 and 4 |
+| [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `Snapshot`, `HardState`, `Message` and the RPC structs, `Ready` |
+| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions |
+| [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, the merge that carries out AppendEntries steps 3 and 4, and `restore`, which carries out Figure 13's steps 6 and 7 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
-| [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, the leader's handling of replies, fast backtracking, and the commit rule |
+| [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, following the current leader, the leader's handling of replies, fast backtracking, and the commit rule |
+| [`snapshot.go`](../raft/snapshot.go) | Sending a snapshot in chunks, the InstallSnapshot receiver's steps 1–8, and the leader's handling of replies |
 
 ## Files in internal/storage/
 
@@ -170,8 +226,9 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | --- | --- |
 | [`storage.go`](../internal/storage/storage.go) | `Storage`, the interface the runtime persists through |
 | [`memory.go`](../internal/storage/memory.go) | `Memory`, storage in memory for tests |
-| [`file.go`](../internal/storage/file.go) | `FileStorage`, `OpenFileStorage`, and `FileOptions`: a `Ready` into WAL records, and records back into hard state and a log |
-| [`wal.go`](../internal/storage/wal.go) | Segments, appends, rotation, and recovery; `ErrCorrupt` |
+| [`file.go`](../internal/storage/file.go) | `FileStorage`, `OpenFileStorage`, and `FileOptions`: a `Ready` into WAL records and a snapshot file, records back into hard state and a log, and the removal of files a snapshot or a crash left behind |
+| [`wal.go`](../internal/storage/wal.go) | Segments, appends, rotation, starting over from a snapshot, writing a file whole, and recovery; `ErrCorrupt` |
+| [`snapshot.go`](../internal/storage/snapshot.go) | The snapshot file's layout, its encoder, and its decoder |
 | [`record.go`](../internal/storage/record.go) | The record layout, its encoder, and its decoder |
 | [`fs.go`](../internal/storage/fs.go) | `FS`, `File`, and `OSFS` |
 | [`faultfs.go`](../internal/storage/faultfs.go) | `FaultFS`, the in-memory file system that crashes on demand; `ErrCrashed` |

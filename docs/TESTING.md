@@ -9,10 +9,10 @@ Six independent harnesses produce the evidence for Wilson's correctness, and no 
 | Harness | What it catches | When it runs | State |
 | --- | --- | --- | --- |
 | Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Runs every test; the code so far is single-threaded |
-| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks the five Figure 3 properties, terms, votes, and applied order after every event, with crashes in the middle of disk writes, and liveness after faults heal |
+| Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks the five Figure 3 properties, terms, votes, applied order, and every snapshot after every event, with crashes in the middle of disk writes and compaction as often as every entry, and liveness after faults heal |
 | MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | 20 consecutive passing runs | Not built |
 | Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Not built |
-| Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target nightly and before each phase tag; crash tests on every test run | Fuzzes the WAL record decoder; crash tests at every write boundary of the storage |
+| Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target nightly and before each phase tag; crash tests on every test run | Fuzzes the WAL record and snapshot decoders; crash tests at every write boundary of the storage, snapshot saves included |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Nightly | Not built |
 
 A nightly workflow ([nightly.yml](../.github/workflows/nightly.yml)) runs `make sim SEEDS=50000` and `make fuzz FUZZTIME=10m`. GitHub runs it on the default branch, and it can be started by hand from the Actions tab.
@@ -39,7 +39,7 @@ go test ./raft -run TestCluster
 
 [`internal/sim`](../internal/sim) runs a whole cluster in one goroutine on a virtual clock. One random source, seeded by the run's seed, makes every choice: each server's clock skew (up to 20% fast or slow), each message's delay, loss, and duplication, every fault, and each server core's own random source for election timeouts. The simulator uses only integer arithmetic, so a seed replays byte for byte on any machine; traces match on arm64 and amd64.
 
-Each server handles every `Ready` as a runtime does: it saves the hard state and entries, sends the messages, then applies the committed entries. It saves through the real `FileStorage`, on its own `FaultFS`: a disk in memory that keeps what was synced through every crash, and a random prefix of the rest ([Fuzzing and disk fault injection](#fuzzing-and-disk-fault-injection)). A crash between events loses nothing, since every `Save` synced before it returned. A crash during a disk operation fails the `Save` under way, so none of that `Ready`'s messages leave, and it may leave a torn record for recovery to truncate when the server restarts. After every event, the simulator checks the five properties of Figure 3 and more:
+Each server handles every `Ready` as a runtime does: it saves the hard state, snapshot, and entries, sends the messages, restores its state machine from a snapshot the leader sent, then applies the committed entries. Its state machine is the list of commands it applied, and a snapshot holds that list as JSON. It compacts its log once it has applied a set number of entries past its last snapshot, as often as every entry in some seeds. It saves through the real `FileStorage`, on its own `FaultFS`: a disk in memory that keeps what was synced through every crash, and a random prefix of the rest ([Fuzzing and disk fault injection](#fuzzing-and-disk-fault-injection)). A crash between events loses nothing, since every `Save` synced before it returned. A crash during a disk operation fails the `Save` under way, so none of that `Ready`'s messages leave. It may leave a torn record for recovery to truncate when the server restarts, or a snapshot save undone. After every event, the simulator checks the five properties of Figure 3 and more:
 
 - **Election Safety:** no two servers ever lead the same term, over the whole run.
 - **Leader Append-Only:** a leader never writes at or below its last stored index.
@@ -48,17 +48,21 @@ Each server handles every `Ready` as a runtime does: it saves the hard state and
 - **State Machine Safety:** no two servers ever apply different entries at one index.
 - **Terms never fall:** a server's `currentTerm` never decreases, and a restarted server comes back in at least the highest term it saved. A term lost with a crashed `Save` never left in a message, so it does not count.
 - **One vote per term:** no server votes for a second candidate in a term, even after a restart. A vote counts once its `Save` returns, and every restart checks the vote it restored against the votes saved.
-- **Applied order:** each server keeps `lastApplied ≤ commitIndex ≤` its last index, and applies entries one by one from index 1 after every boot.
+- **Applied order:** each server keeps `lastApplied ≤ commitIndex ≤` its last index, neither ever falls within a boot, and it applies entries one by one after its snapshot, jumping forward only to install a snapshot from the leader.
+- **Snapshots:** every snapshot a server compacts, installs, or restarts from holds exactly the commands applied through its last included index, and that entry's term (State Machine Safety). The simulator's copy of each log keeps the committed entries a snapshot replaced, so the checks above go on reading whole logs, and a leader's compaction may not change the entries after its snapshot (Leader Append-Only).
 
 The first violation ends the run.
 
 ### The randomized schedule
 
-`TestRandomized` runs seeds 0 to N−1 in parallel. Seed s runs a cluster of 1 + (s mod 5) servers for ten seconds of virtual time and injects a fault every 50 ms to 1 s: a partition into two or three groups, a heal, a one-way cut, a crash, a restart, or new network conditions (up to 50% loss, 20% duplication, and 400 ms delay). Half of all crashes hit the current leader, if one is up; half strike at once, between events, and the rest during one of the server's next six disk operations. Meanwhile a client proposes a new command every 10 to 200 ms to a server that believes it leads, stale leaders included. Then every fault heals: all links return, the network goes back to 1–10 ms with no loss, crashes still to come are cancelled, and crashed servers restart. The liveness check follows: within ten seconds the servers must agree on a leader, and within ten more apply a command proposed to it, which commits every entry before it in the leader's log.
+`TestRandomized` runs seeds 0 to N−1 in parallel. Seed s runs a cluster of 1 + (s mod 5) servers for ten seconds of virtual time and injects a fault every 50 ms to 1 s: a partition into two or three groups, a heal, a one-way cut, a crash, a restart, or new network conditions (up to 50% loss, 20% duplication, and 400 ms delay). Half of all crashes hit the current leader, if one is up; half strike at once, between events, and the rest during one of the server's next six disk operations. Meanwhile a client proposes a new command every 10 to 200 ms to a server that believes it leads, stale leaders included. In half the seeds it first waits up to two seconds whenever a leader of a later term appears, which leaves a new leader without an entry of its own term to commit. The seed also sets how often servers compact: never, or after every 1, 2, 4, or 8 entries applied. And it sets how leaders send snapshots: whole, or in chunks of 16 or 128 bytes. Then every fault heals: all links return, the network goes back to 1–10 ms with no loss, crashes still to come are cancelled, and crashed servers restart. The liveness check follows: within ten seconds the servers must agree on a leader, and within ten more apply a command proposed to it, which commits every entry before it in the leader's log.
 
-Over 1,000 seeds, 789 crashes are set to strike mid-write and 733 do, 332 of them leaving a torn record that recovery truncates, beside 804 crashes between events.
+Over 1,000 seeds:
 
-Some bugs need rare interleavings. A commit rule that counted replicas of earlier-term entries, the hazard of Figure 8, failed only 3 of 50,000 seeds, even with half of all crashes aimed at the leader; the nightly sweep is there for bugs like it, and Figure 8 also has its own scripted test.
+- 810 crashes are set to strike mid-write and 745 do, 272 of them leaving a torn record that recovery truncates. 841 more crashes strike between events.
+- Servers compact 33,696 times, restart from a snapshot 965 times, and install 2,445 snapshots from a leader.
+
+Some bugs need rare interleavings. A commit rule that counted replicas of earlier-term entries, the hazard of Figure 8, failed only 3 of 50,000 seeds while the client never paused, even with half of all crashes aimed at the leader. With the pause after each new leader it fails 24 of 50,000, nearly all of them seeds that pause. The nightly sweep is there for bugs like it, and Figure 8 also has its own scripted test.
 
 | Run | Seeds |
 | --- | --- |
@@ -67,33 +71,37 @@ Some bugs need rare interleavings. A commit rule that counted replicas of earlie
 | `make sim SEEDS=20000`, before each phase tag | 20,000 |
 | The nightly workflow | 50,000 |
 
-A seed costs about two milliseconds of CPU, so 50,000 seeds take seconds.
+A seed costs about two and a half milliseconds of CPU, so 50,000 seeds take seconds.
 
 ### Reading a trace
 
-Every run keeps a trace, and a failing seed prints it after the error. These lines are picked from seed 31's:
+Every run keeps a trace, and a failing seed prints it after the error. These lines are picked from seed 31's, replayed with `-seed=31`, which adds the messages:
 
 ```text
-t=0.000ms n1 boot term=0 votedFor=none lastIndex=0 tick=11.920ms
-t=465.834ms n2 follower→candidate term=0→1 leader=none
+t=0.000ms n1 boot term=0 votedFor=none snapshot=0 lastIndex=0 tick=11.920ms
 t=470.672ms n2 candidate→leader term=1 leader=none→n2
-t=477.930ms n1 follower term=1 leader=none→n2
+t=595.639ms n2 compact lastIncludedIndex=1
+t=595.639ms n2 leader term=1 leader=n2 commitIndex=0→1 lastApplied=0→1
 t=1729.891ms n2 will crash during disk operation 2 from now
 t=1822.665ms n2 crash during a disk write
-t=3584.306ms n2 boot term=1 votedFor=n2 lastIndex=14 tick=10.690ms
+t=3584.306ms n2 boot term=1 votedFor=n2 snapshot=13 lastIndex=14 tick=10.690ms
 t=3937.444ms n2 candidate→leader term=5 leader=none→n2
-t=5553.260ms partition n2 | n1
-t=6831.493ms n2 will crash during disk operation 2 from now
-t=6860.047ms n2 crash during a disk write
-t=8661.643ms network loss=0% duplication=5% delay=1.000ms..400.000ms
 t=10423.191ms heal
-t=10423.191ms n2 msg="storage: truncated a record torn by a crash at the end of the WAL" segment=0000000000000025.wal offset=232 bytes=19
-t=10423.191ms n2 boot term=5 votedFor=n2 lastIndex=42 tick=10.690ms
-t=11020.597ms n2 leader term=18 leader=n2 commitIndex=0→43 lastApplied=0→43
+t=10423.191ms n2 msg="storage: truncated a record torn by a crash at the end of the WAL" segment=0000000000000043.wal offset=302 bytes=19
+t=10423.191ms n2 boot term=5 votedFor=n2 snapshot=33 lastIndex=42 tick=10.690ms
+t=10998.818ms n2 candidate→leader term=18 leader=none→n2
+t=11015.795ms n2→n1 InstallSnapshot term=18 leaderId=2 lastIncludedIndex=33 lastIncludedTerm=5 offset=0 bytes=16 done=false
+t=11020.597ms n1→n2 InstallSnapshotResponse term=18 lastIncludedIndex=33 offset=16 done=false
+t=11022.171ms n1 follower term=18 leader=n2 commitIndex=32→33 lastApplied=32→33
+t=11026.003ms n1→n2 InstallSnapshotResponse term=18 lastIncludedIndex=33 offset=0 done=true
+t=11029.829ms n2 leader term=18 leader=n2 commitIndex=33→43 lastApplied=33→43
 ```
 
+Seed 31 compacts after every entry and sends snapshots in 16-byte chunks. In its last lines, n1 commits through index 33 by AppendEntries while the snapshot through 33 is on its way, so it answers the next chunk with `done=true` without installing it.
+
 - `t=` is virtual time since the run began, in milliseconds to the microsecond.
-- `boot` starts a server from its write-ahead log, showing the term, vote, and last log index it restored, and its skewed tick interval. `crash` stops a server between events. `will crash during disk operation N from now` sets a crash to strike during the server's Nth disk operation from then, and `crash during a disk write` is that crash striking.
+- `boot` starts a server from its snapshot and write-ahead log, showing the term and vote it restored, its snapshot's last included index (0 for none), its last log index, and its skewed tick interval. `crash` stops a server between events. `will crash during disk operation N from now` sets a crash to strike during the server's Nth disk operation from then, and `crash during a disk write` is that crash striking.
+- `compact` is a server's state machine taking a snapshot through the index shown. `install snapshot` is a server resetting its state machine from a snapshot the leader sent.
 - A `msg=` line is the server's storage logging; here recovery truncates a record torn by the crash, naming the segment, the offset, and the bytes dropped.
 - A server's own line shows its role, term, and leader after an event, with `old→new` for each one that changed, and `commitIndex` and `lastApplied` when they moved.
 - `propose` shows a client's command reaching a server: the index and term of the new entry, or why it was refused.
@@ -106,11 +114,11 @@ t=11020.597ms n2 leader term=18 leader=n2 commitIndex=0→43 lastApplied=0→43
 go test ./internal/sim -run TestRandomized -seed=N -v
 ```
 
-This reruns seed N alone and logs its trace with every message added. A delivery shows as `n2→n3 RequestVote term=4 candidateId=2 lastLogIndex=0 lastLogTerm=0`, or `n3→n1 AppendEntries term=1 leaderId=3 prevLogIndex=0 prevLogTerm=0 entries=[1@1] leaderCommit=0` with entries as index@term, using the paper's field names. A message the network loses or copies as it is sent is marked `lost` or `duplicated`; one stopped on arrival by a partition or a crashed receiver is marked `cut` or `down`.
+This reruns seed N alone and logs its trace with every message added. A delivery shows as `n2→n3 RequestVote term=4 candidateId=2 lastLogIndex=0 lastLogTerm=0`, or `n3→n1 AppendEntries term=1 leaderId=3 prevLogIndex=0 prevLogTerm=0 entries=[1@1] leaderCommit=0` with entries as index@term, or `n2→n1 InstallSnapshot term=18 leaderId=2 lastIncludedIndex=33 lastIncludedTerm=5 offset=16 bytes=16 done=false` with the chunk's size in bytes, using the paper's field names. A message the network loses or copies as it is sent is marked `lost` or `duplicated`; one stopped on arrival by a partition or a crashed receiver is marked `cut` or `down`.
 
 ### Scripted scenarios
 
-`sim.New` builds a cluster for a scripted test. `RunFor`, `RunUntil`, `Propose`, `Partition`, `Cut`, `Heal`, `Crash`, `CrashDuringDiskOp`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples. `TestCrashesMidWriteKeepSafety` crashes a server mid-write every 200 ms in a cluster of five taking proposals, about 870 crashes over its ten seeds, and then requires the cluster to commit a new command everywhere.
+`sim.New` builds a cluster for a scripted test, with `Options` for its size, seed, compaction threshold, and snapshot chunk size. `RunFor`, `RunUntil`, `Propose`, `Partition`, `Cut`, `Heal`, `Crash`, `CrashDuringDiskOp`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples. `TestCrashesMidWriteKeepSafety` crashes a server mid-write every 200 ms in a cluster of five taking proposals and compacting every three entries, about 900 crashes over its ten seeds, and then requires the cluster to commit a new command everywhere. `TestLaggingServerCatchesUpThroughSnapshot` cuts a server off while the others commit and compact thirty commands, then requires it to catch up from the leader's snapshot, sent in 16-byte chunks.
 
 ## MIT 6.5840 test suites
 
@@ -127,11 +135,14 @@ Not built yet. Client histories recorded by the simulator (with virtual timestam
 `make fuzz` runs [scripts/fuzz.sh](../scripts/fuzz.sh), which finds every `Fuzz*` target in the module with `go test -list` and runs each for `FUZZTIME`. A new target is picked up without any change to the Makefile or CI. Corpora live in each package's `testdata/fuzz/`.
 
 - `FuzzWALRecordDecode` (in `internal/storage`) feeds arbitrary bytes to the WAL record decoder. It must never panic, and every record it accepts must encode back to exactly the bytes it came from, so no two byte strings decode to the same record.
-- The snapshot decoder, RPC JSON decoding, and KV command decoding get targets as they are written.
+- `FuzzSnapshotDecode` (in `internal/storage`) does the same for the snapshot file decoder.
+- RPC JSON decoding and KV command decoding get targets as they are written.
 
-File storage reaches the disk only through a small file-system interface ([ARCHITECTURE.md](ARCHITECTURE.md#file-systems)), and `FaultFS` implements it in memory with crashes on demand: at once, or during the nth write, truncation, file creation, or fsync. A crash keeps everything synced and a random prefix of the rest, as a power failure would, the last write possibly cut mid-record. A seed fixes every choice, so a failure repeats.
+File storage reaches the disk only through a small file-system interface ([ARCHITECTURE.md](ARCHITECTURE.md#file-systems)), and `FaultFS` implements it in memory with crashes on demand: at once, or during the nth write, truncation, file creation, rename, removal, or fsync. A crash keeps everything synced and a random prefix of the rest, as a power failure would, the last write possibly cut mid-record and the last renames and removals undone. A seed fixes every choice, so a failure repeats.
 
-- `TestCrashAtEveryWriteBoundary` saves a run of `Ready`s, overwrites and segment changes among them, and crashes during each of its 22 disk operations, 30 seeds each, then again during the recovery that follows. Recovery must return everything each finished `Save` wrote plus a prefix of the `Save` that crashed, never less, and must keep taking writes.
+- `TestCrashAtEveryWriteBoundary` saves a run of `Ready`s, overwrites, segment changes, and two snapshots among them. It crashes during each of their 55 disk operations, 30 seeds each, then again during each of the first four operations of the recovery that follows. Recovery must return everything each finished `Save` wrote plus a prefix of the `Save` that crashed, never less, and must keep taking writes. A `Save` with a snapshot is all or nothing: the old snapshot and log, or the new ones.
+- `TestRestoreEqualsFullReplay` runs a one-server cluster that compacts at random and restarts from a crashed disk about two hundred times over twenty seeds. Each time, the state machine it rebuilds from its snapshot and the log after it must hold exactly the commands replaying the whole log would.
+- `TestSnapshotRemovesWhatItReplaces`, `TestRecoveryRemovesLeftovers`, and `TestBrokenSnapshotRefusesToStart` check that a durable snapshot removes the segments and snapshot it replaces, that recovery removes what a crash left behind, and that a missing, damaged, or mismatched snapshot file refuses to start.
 - On the real file system, `TestTornFinalRecordIsTruncated` cuts the last record at every length, `TestDamagedRecordRefusesToStart` damages every byte of every record, and `TestMissingSegmentRefusesToStart` deletes and shortens segments. [ADR-0003](adr/0003-wal-format.md) says what recovery truncates and what it refuses.
 - `TestFileStorageMatchesMemory` checks file storage step by step against the in-memory reference, reopening it after every step.
 

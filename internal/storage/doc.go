@@ -2,8 +2,9 @@
 // compaction its snapshots.
 //
 // Storage is the interface the runtime persists through. Memory
-// implements it in memory, for tests, and FileStorage implements it with
-// a segmented write-ahead log on disk (docs/adr/0003-wal-format.md). A
+// implements it in memory, for tests, and FileStorage implements it on
+// disk with a segmented write-ahead log and a snapshot file
+// (docs/adr/0003-wal-format.md, docs/adr/0005-snapshot-format.md). A
 // write is complete only once it is fsynced; the runtime depends on that
 // to keep a reply from leaving before the state it reflects is durable.
 //

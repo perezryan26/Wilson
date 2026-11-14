@@ -35,10 +35,12 @@ func newLog(snap *Snapshot, restored []Entry) raftLog {
 // lastIncludedIndex, or 0 if there is no snapshot.
 func (l *raftLog) snapshotIndex() Index { return l.entries[0].Index }
 
-// lastIndex returns the index of the last entry, or 0 if the log is empty.
+// lastIndex returns the index of the last entry, or of the sentinel if no
+// entry follows it: the snapshot's last included index, or 0.
 func (l *raftLog) lastIndex() Index { return l.entries[len(l.entries)-1].Index }
 
-// lastTerm returns the term of the last entry, or 0 if the log is empty.
+// lastTerm returns the term of the last entry, or of the sentinel if no
+// entry follows it: the snapshot's last included term, or 0.
 func (l *raftLog) lastTerm() Term { return l.entries[len(l.entries)-1].Term }
 
 // append adds e, which follows the last entry, to the log.

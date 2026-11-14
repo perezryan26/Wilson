@@ -32,6 +32,7 @@ Each record is laid out as follows, in little-endian byte order:
 | 1 | hard state | `currentTerm u64`, `votedFor u64` (0 for none) |
 | 2 | entry | `index u64`, `term u64`, `entry type u8`, then the command, to the end of the record |
 | 3 | truncation | `index u64`: every entry from `index` on is discarded |
+| 4 | snapshot | `currentTerm u64`, `votedFor u64`, `lastIncludedIndex u64`, `lastIncludedTerm u64`: the log starts over from a snapshot ([ADR-0005](0005-snapshot-format.md)) |
 
 Type 0 is invalid. The entry type byte is 0, a normal entry, in every record written today. The election no-op and configuration entries will take other values, so they need no new layout.
 
@@ -56,7 +57,7 @@ After a write or fsync fails, every later `Save` fails too. What the disk holds 
 
 Opening the WAL replays every segment in order and applies each record.
 
-- **Gaps.** Each segment must begin with the record after the previous segment's last, so a missing segment, or one cut short at a record boundary, shows as a gap. The first segment must begin with record 0 until log compaction starts deleting old segments.
+- **Gaps.** Each segment must begin with the record after the previous segment's last, so a missing segment, or one cut short at a record boundary, shows as a gap. The first segment must begin with record 0, unless it begins with a snapshot record; [ADR-0005](0005-snapshot-format.md) describes how log compaction starts the WAL over and deletes the segments before.
 - **A torn final record.** In the last segment only, a record that runs past the end of the file, its header or its body cut short, is a write torn by a crash. No `Save` returned for it. Recovery truncates the file where the record begins, fsyncs, and logs the segment, the offset, and the bytes dropped, so new records never follow the remains.
 - **Everything else refuses to start**, with an error wrapping `ErrCorrupt` that names the segment and offset: a checksum mismatch, an empty record or one of unknown type, a payload of the wrong size, an entry that is not the next index, a truncation outside the log, a record cut short in an earlier segment, or a `.wal` file whose name is not exactly a segment name.
 
