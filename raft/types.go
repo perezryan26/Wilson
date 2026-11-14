@@ -23,6 +23,19 @@ type Entry struct {
 	Data  []byte
 }
 
+// Snapshot is the state machine's state as of a log index, which replaces
+// every log entry up to and including that index (§7, Figure 12). It
+// covers only committed entries.
+type Snapshot struct {
+	LastIncludedIndex Index // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  Term  // term of LastIncludedIndex
+
+	// Data is the state machine's state, as the service encoded it. No
+	// one modifies it once the snapshot exists, so it is shared rather
+	// than copied.
+	Data []byte
+}
+
 // HardState is the state Figure 2 requires a server to keep on stable
 // storage, apart from the log, before it responds to any RPC.
 type HardState struct {
@@ -37,10 +50,12 @@ type HardState struct {
 type Message struct {
 	From, To NodeID
 
-	RequestVote           *RequestVoteRequest
-	RequestVoteResponse   *RequestVoteResponse
-	AppendEntries         *AppendEntriesRequest
-	AppendEntriesResponse *AppendEntriesResponse
+	RequestVote             *RequestVoteRequest
+	RequestVoteResponse     *RequestVoteResponse
+	AppendEntries           *AppendEntriesRequest
+	AppendEntriesResponse   *AppendEntriesResponse
+	InstallSnapshot         *InstallSnapshotRequest
+	InstallSnapshotResponse *InstallSnapshotResponse
 }
 
 // term returns the term m carries: the sender's currentTerm, which every
@@ -55,6 +70,10 @@ func (m Message) term() Term {
 		return m.AppendEntries.Term
 	case m.AppendEntriesResponse != nil:
 		return m.AppendEntriesResponse.Term
+	case m.InstallSnapshot != nil:
+		return m.InstallSnapshot.Term
+	case m.InstallSnapshotResponse != nil:
+		return m.InstallSnapshotResponse.Term
 	}
 	return 0
 }
@@ -109,15 +128,44 @@ type AppendEntriesResponse struct {
 	ConflictIndex Index
 }
 
+// InstallSnapshotRequest holds the arguments of the InstallSnapshot RPC,
+// which a leader sends to a follower that needs entries the leader has
+// already replaced with a snapshot (§7, Figure 13).
+type InstallSnapshotRequest struct {
+	Term              Term   // leader's term
+	LeaderID          NodeID // so the follower can redirect clients
+	LastIncludedIndex Index  // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  Term   // term of LastIncludedIndex
+	Data              []byte // the snapshot's state machine state
+}
+
+// InstallSnapshotResponse holds the results of the InstallSnapshot RPC.
+type InstallSnapshotResponse struct {
+	Term Term // currentTerm, for the leader to update itself
+
+	// LastIncludedIndex names the snapshot the reply answers: the
+	// follower's log now matches the leader's through it. The reply says
+	// what it acknowledges because replies can arrive late, twice, or out
+	// of order.
+	LastIncludedIndex Index
+}
+
 // Ready holds the effects a node produced since the previous call to
 // Node.Ready. The runtime carries them out in field order: it persists and
-// fsyncs HardState and Entries, then sends Messages, then applies
+// fsyncs HardState, Snapshot, and Entries, then sends Messages, then
+// restores the state machine from Snapshot, when it must, and applies
 // CommittedEntries. A granted vote or an acknowledged entry thus never
 // leaves before it is durable, and no entry is applied before it is on
 // this server's disk (docs/adr/0001-deterministic-core.md).
 type Ready struct {
 	// HardState is the hard state to persist, or nil if it is unchanged.
 	HardState *HardState
+	// Snapshot is a snapshot to persist, or nil: one the leader sent with
+	// InstallSnapshot. It and Entries, which then hold every log entry
+	// after it, replace the whole stored log. The runtime restores the
+	// state machine from it before applying CommittedEntries (Figure 13,
+	// step 8), because it is past every entry applied so far.
+	Snapshot *Snapshot
 	// Entries are log entries to persist, in index order. When
 	// Entries[0].Index is at or below the last stored index, storage first
 	// discards every stored entry from that index on, because the node is

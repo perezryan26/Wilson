@@ -18,9 +18,14 @@ func (n *Node) broadcastAppend() {
 // sendAppend sends server to an AppendEntries carrying every entry from its
 // nextIndex on (Figure 2, leaders), or none when it already has them all,
 // which makes it a heartbeat (§5.2). Every heartbeat therefore also retries
-// whatever a lost message failed to deliver.
+// whatever a lost message failed to deliver. If the snapshot has replaced
+// the entry at nextIndex, it sends the snapshot instead (§7).
 func (n *Node) sendAppend(to NodeID) {
 	next := n.nextIndex[to]
+	if next <= n.log.snapshotIndex() {
+		n.sendSnapshot(to)
+		return
+	}
 	prevTerm, _ := n.log.term(next - 1)
 	n.send(Message{To: to, AppendEntries: &AppendEntriesRequest{
 		Term:         n.currentTerm,
@@ -43,7 +48,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 	n.followLeader(req.LeaderID)
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm (§5.3).
-	if term, ok := n.log.term(req.PrevLogIndex); !ok || term != req.PrevLogTerm {
+	if !n.hasEntry(req.PrevLogIndex, req.PrevLogTerm) {
 		n.rejectConflict(req.LeaderID, req.PrevLogIndex)
 		return
 	}
@@ -63,6 +68,18 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 		Success:    true,
 		MatchIndex: lastNew,
 	}})
+}
+
+// hasEntry reports whether the log holds an entry at index of term. The
+// snapshot has replaced the entries before its last included one, and
+// their terms with them, but it covers only committed entries, which
+// every leader's log holds (Figure 3, Leader Completeness): they match.
+func (n *Node) hasEntry(index Index, term Term) bool {
+	if index < n.log.snapshotIndex() {
+		return true
+	}
+	t, ok := n.log.term(index)
+	return ok && t == term
 }
 
 // followLeader makes the node a follower of leader, which sent a request

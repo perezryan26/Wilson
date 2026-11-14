@@ -65,7 +65,8 @@ func (c Config) validate() error {
 // stopped. It is the zero value for a server that has never run.
 type RestoredState struct {
 	HardState HardState
-	Entries   []Entry // the log, in index order
+	Snapshot  *Snapshot // the latest snapshot, or nil
+	Entries   []Entry   // the log after the snapshot, in index order
 }
 
 // Role is a server's state in §5.1: follower, candidate, or leader.
@@ -115,13 +116,16 @@ type Node struct {
 	heartbeatTick int
 	rand          *rand.Rand
 
-	// Persistent state on all servers (Figure 2).
+	// Persistent state on all servers (Figure 2), and the snapshot that
+	// replaced the log's earlier entries (§7), which a leader sends to
+	// followers that need them.
 	currentTerm Term
 	votedFor    NodeID
 	log         raftLog
+	snapshot    *Snapshot
 
 	// Volatile, as in Figure 2: a restarted server relearns commitIndex
-	// from the leader and applies its log again from the start.
+	// from the leader and applies its log again from its snapshot on.
 	commitIndex Index
 	lastApplied Index
 
@@ -137,14 +141,19 @@ type Node struct {
 	electionTimeout  int // drawn from [electionTick, 2*electionTick)
 	heartbeatElapsed int // ticks since a leader's last heartbeat or a candidate's last requests
 
-	msgs          []Message // messages for the next Ready
-	prevHardState HardState // the hard state as of the last Ready
-	unstable      Index     // the first log index not yet handed to storage
+	msgs             []Message // messages for the next Ready
+	prevHardState    HardState // the hard state as of the last Ready
+	unstable         Index     // the first log index not yet handed to storage
+	snapshotUnstable bool      // the snapshot is not yet handed to storage
 }
 
 // NewNode returns a server that starts as a follower (§5.2) with the state
-// its storage restored. It panics if cfg is invalid, because a server that
-// misjudges its cluster can help elect two leaders in one term.
+// its storage restored. The runtime has already restored the state
+// machine from the snapshot, if there is one, and the snapshot covers
+// only committed entries, so both commitIndex and lastApplied start at
+// its last included index. NewNode panics if cfg is invalid, because a
+// server that misjudges its cluster can help elect two leaders in one
+// term.
 func NewNode(cfg Config, restored RestoredState) *Node {
 	if err := cfg.validate(); err != nil {
 		panic("raft: invalid Config: " + err.Error())
@@ -158,10 +167,13 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		rand:          cfg.Rand,
 		currentTerm:   hs.CurrentTerm,
 		votedFor:      hs.VotedFor,
-		log:           newLog(restored.Entries),
+		log:           newLog(restored.Snapshot, restored.Entries),
+		snapshot:      restored.Snapshot,
 		prevHardState: hs,
-		unstable:      Index(len(restored.Entries)) + 1,
 	}
+	n.commitIndex = n.log.snapshotIndex()
+	n.lastApplied = n.commitIndex
+	n.unstable = n.log.lastIndex() + 1
 	n.becomeFollower(hs.CurrentTerm, None)
 	n.resetElectionTimer()
 	return n
@@ -208,6 +220,10 @@ func (n *Node) Step(m Message) {
 		n.handleAppendEntries(m.AppendEntries)
 	case m.AppendEntriesResponse != nil:
 		n.handleAppendEntriesResponse(m.From, m.AppendEntriesResponse)
+	case m.InstallSnapshot != nil:
+		n.handleInstallSnapshot(m.InstallSnapshot)
+	case m.InstallSnapshotResponse != nil:
+		n.handleInstallSnapshotResponse(m.From, m.InstallSnapshotResponse)
 	}
 }
 
@@ -232,6 +248,11 @@ func (n *Node) Propose(cmd []byte) (Index, Term, error) {
 func (n *Node) Ready() Ready {
 	rd := Ready{Messages: n.msgs}
 	n.msgs = nil
+	if n.snapshotUnstable {
+		s := *n.snapshot
+		rd.Snapshot = &s
+		n.snapshotUnstable = false
+	}
 	if n.unstable <= n.log.lastIndex() {
 		rd.Entries = n.log.from(n.unstable)
 		n.unstable = n.log.lastIndex() + 1
