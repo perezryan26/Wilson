@@ -33,6 +33,12 @@ const (
 	// recordTruncate holds index u64: every entry from index on is
 	// discarded, because the entries that follow overwrite them.
 	recordTruncate recordType = 3
+	// recordSnapshot begins a segment that replaces every segment before
+	// it: the log starts over after a snapshot. It holds currentTerm u64
+	// and votedFor u64, then the snapshot's lastIncludedIndex u64 and
+	// lastIncludedTerm u64; the entry records that follow it hold the log
+	// after the snapshot.
+	recordSnapshot recordType = 4
 )
 
 // entryNormal is the entry type byte of every entry record. Only normal
@@ -40,12 +46,13 @@ const (
 // and configuration entries will need no new record layout.
 const entryNormal byte = 0
 
-// record is one WAL record. Which field holds its payload depends on typ.
+// record is one WAL record. Which fields hold its payload depends on typ.
 type record struct {
 	typ       recordType
-	hardState raft.HardState // recordHardState
+	hardState raft.HardState // recordHardState, recordSnapshot
 	entry     raft.Entry     // recordEntry
-	index     raft.Index     // recordTruncate: the first index discarded
+	index     raft.Index     // recordTruncate: the first index discarded; recordSnapshot: lastIncludedIndex
+	term      raft.Term      // recordSnapshot: lastIncludedTerm
 }
 
 // appendRecord appends r, framed, to buf and returns the extended buffer.
@@ -65,6 +72,11 @@ func appendRecord(buf []byte, r record) []byte {
 		buf = append(buf, r.entry.Data...)
 	case recordTruncate:
 		buf = le.AppendUint64(buf, uint64(r.index))
+	case recordSnapshot:
+		buf = le.AppendUint64(buf, uint64(r.hardState.CurrentTerm))
+		buf = le.AppendUint64(buf, uint64(r.hardState.VotedFor))
+		buf = le.AppendUint64(buf, uint64(r.index))
+		buf = le.AppendUint64(buf, uint64(r.term))
 	}
 	body := buf[start+headerSize:]
 	le.PutUint32(buf[start:], uint32(len(body)))
@@ -125,6 +137,12 @@ func decodePayload(t recordType, p []byte) (record, error) {
 			return record{}, payloadSizeError(t, p)
 		}
 		return record{typ: t, index: raft.Index(le.Uint64(p))}, nil
+	case recordSnapshot:
+		if len(p) != 32 {
+			return record{}, payloadSizeError(t, p)
+		}
+		hs := raft.HardState{CurrentTerm: raft.Term(le.Uint64(p)), VotedFor: raft.NodeID(le.Uint64(p[8:]))}
+		return record{typ: t, hardState: hs, index: raft.Index(le.Uint64(p[16:])), term: raft.Term(le.Uint64(p[24:]))}, nil
 	}
 	return record{}, fmt.Errorf("unknown record type %d", t)
 }

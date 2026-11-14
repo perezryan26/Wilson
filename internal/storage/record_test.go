@@ -22,11 +22,12 @@ func sampleRecords() []record {
 		{typ: recordEntry, entry: raft.Entry{Index: 42, Term: 9, Data: []byte("put x=1")}},
 		{typ: recordEntry, entry: raft.Entry{Index: 1 << 40, Term: 1 << 33, Data: bytes.Repeat([]byte{0xab}, 1000)}},
 		{typ: recordTruncate, index: 5},
+		{typ: recordSnapshot, hardState: raft.HardState{CurrentTerm: 5, VotedFor: 1}, index: 40, term: 4},
 	}
 }
 
 func sameRecord(a, b record) bool {
-	return a.typ == b.typ && a.hardState == b.hardState && a.index == b.index &&
+	return a.typ == b.typ && a.hardState == b.hardState && a.index == b.index && a.term == b.term &&
 		a.entry.Index == b.entry.Index && a.entry.Term == b.entry.Term && bytes.Equal(a.entry.Data, b.entry.Data)
 }
 
@@ -102,11 +103,13 @@ func TestMalformedRecordIsDamaged(t *testing.T) {
 	cases := map[string][]byte{
 		"empty":                       make([]byte, headerSize),
 		"type 0":                      frame([]byte{0}),
-		"type 4":                      frame([]byte{4, 1, 2, 3}),
+		"type 5":                      frame([]byte{5, 1, 2, 3}),
 		"hard state, 15-byte payload": frame(append([]byte{byte(recordHardState)}, make([]byte, 15)...)),
 		"hard state, 17-byte payload": frame(append([]byte{byte(recordHardState)}, make([]byte, 17)...)),
 		"truncation, 9-byte payload":  frame(append([]byte{byte(recordTruncate)}, make([]byte, 9)...)),
 		"entry, 16-byte payload":      frame(append([]byte{byte(recordEntry)}, make([]byte, 16)...)),
+		"snapshot, 31-byte payload":   frame(append([]byte{byte(recordSnapshot)}, make([]byte, 31)...)),
+		"snapshot, 33-byte payload":   frame(append([]byte{byte(recordSnapshot)}, make([]byte, 33)...)),
 		"entry of unknown entry type": frame(entry(1)),
 	}
 	for name, b := range cases {
@@ -159,6 +162,8 @@ func TestRecordBytes(t *testing.T) {
 			"15000000 88fb3f2f 02 0700000000000000 0300000000000000 00 783d31"},
 		{record{typ: recordTruncate, index: 5},
 			"09000000 c09b6bca 03 0500000000000000"},
+		{record{typ: recordSnapshot, hardState: raft.HardState{CurrentTerm: 3, VotedFor: 2}, index: 7, term: 3},
+			"21000000 754c76cf 04 0300000000000000 0200000000000000 0700000000000000 0300000000000000"},
 	}
 	for _, c := range cases {
 		want, err := hex.DecodeString(strings.ReplaceAll(c.hex, " ", ""))
