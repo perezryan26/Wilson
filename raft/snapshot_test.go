@@ -320,3 +320,75 @@ func TestAppendEntriesMatchesInsideSnapshot(t *testing.T) {
 		t.Errorf("a request inside the snapshot: reply %+v and entries %v, want success through 3 and nothing stored", got, rd.Entries)
 	}
 }
+
+// leaderWithApplied returns server 1 of a cluster of three as the leader
+// of term 1, with entries 1 to 5 committed and applied.
+func leaderWithApplied(t *testing.T) *Node {
+	t.Helper()
+	n := newLeader(t, 3)
+	for i := range 5 {
+		if _, _, err := n.Propose(fmt.Appendf(nil, "c%d", i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n.Step(appendResponse(2, 1, true, 5))
+	if rd := n.Ready(); len(rd.CommittedEntries) != 5 {
+		t.Fatalf("applied %d entries, want 5", len(rd.CommittedEntries))
+	}
+	return n
+}
+
+// §7: a server replaces the entries its state machine has applied with
+// the snapshot the service takes. Storage gets the snapshot and the
+// entries after it, the log keeps those entries, and a follower that
+// needs a replaced entry gets the snapshot.
+func TestCompactReplacesAppliedEntries(t *testing.T) {
+	n := leaderWithApplied(t)
+	data := []byte("state@3")
+	if err := n.Compact(3, data); err != nil {
+		t.Fatal(err)
+	}
+	data[0] = 'X' // the node keeps a copy
+	rd := n.Ready()
+	wantSnapshot(t, rd, &Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 1, Data: []byte("state@3")})
+	wantEntries(t, "Ready entries", rd.Entries, []Entry{{Index: 4, Term: 1, Data: []byte("c4")}, {Index: 5, Term: 1, Data: []byte("c5")}})
+	if _, ok := n.log.term(2); ok || n.log.snapshotIndex() != 3 || n.log.lastIndex() != 5 {
+		t.Errorf("log after the snapshot through 3 ends at %d, still holding entry 2: %t", n.log.lastIndex(), ok)
+	}
+	if st := n.Status(); st.CommitIndex != 5 || st.LastApplied != 5 {
+		t.Errorf("status = %+v, want commitIndex and lastApplied unchanged at 5", st)
+	}
+	n.Step(Message{From: 3, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 1, ConflictIndex: 1}})
+	want := InstallSnapshotRequest{Term: 1, LeaderID: 1, LastIncludedIndex: 3, LastIncludedTerm: 1, Data: []byte("state@3")}
+	sent := sentTo(n.Ready(), 3)
+	if len(sent) != 1 || sent[0].InstallSnapshot == nil || fmt.Sprintf("%+v", *sent[0].InstallSnapshot) != fmt.Sprintf("%+v", want) {
+		t.Errorf("sent server 3 %+v, want InstallSnapshot %+v", sent, want)
+	}
+}
+
+// Compact refuses an index the state machine has not applied, or one the
+// snapshot already covers, and changes nothing.
+func TestCompactRefusesUnappliedOrCompactedIndex(t *testing.T) {
+	n := leaderWithApplied(t)
+	if _, _, err := n.Propose([]byte("c6")); err != nil {
+		t.Fatal(err)
+	}
+	n.Ready()
+	for _, index := range []Index{0, 6} {
+		if err := n.Compact(index, nil); err == nil {
+			t.Errorf("Compact(%d) with entries 1 to 5 applied succeeded", index)
+		}
+	}
+	if err := n.Compact(3, nil); err != nil {
+		t.Fatal(err)
+	}
+	n.Ready()
+	for _, index := range []Index{2, 3} {
+		if err := n.Compact(index, nil); err == nil {
+			t.Errorf("Compact(%d) after a snapshot through 3 succeeded", index)
+		}
+	}
+	if rd := n.Ready(); rd.Snapshot != nil || n.log.snapshotIndex() != 3 {
+		t.Errorf("refused compactions left Ready snapshot %+v and a snapshot through %d", rd.Snapshot, n.log.snapshotIndex())
+	}
+}

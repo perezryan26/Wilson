@@ -160,11 +160,13 @@ type InstallSnapshotResponse struct {
 type Ready struct {
 	// HardState is the hard state to persist, or nil if it is unchanged.
 	HardState *HardState
-	// Snapshot is a snapshot to persist, or nil: one the leader sent with
-	// InstallSnapshot. It and Entries, which then hold every log entry
-	// after it, replace the whole stored log. The runtime restores the
-	// state machine from it before applying CommittedEntries (Figure 13,
-	// step 8), because it is past every entry applied so far.
+	// Snapshot is a snapshot to persist, or nil: one Compact took, or one
+	// the leader sent with InstallSnapshot. It and Entries, which then
+	// hold every log entry after it, replace the whole stored log. If it
+	// is past the last entry the state machine applied, which is always
+	// so for one from the leader and never for one from Compact, the
+	// runtime restores the state machine from it before applying
+	// CommittedEntries (Figure 13, step 8).
 	Snapshot *Snapshot
 	// Entries are log entries to persist, in index order. When
 	// Entries[0].Index is at or below the last stored index, storage first

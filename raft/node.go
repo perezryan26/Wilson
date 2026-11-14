@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -240,6 +241,27 @@ func (n *Node) Propose(cmd []byte) (Index, Term, error) {
 	n.broadcastAppend()
 	n.maybeCommit()
 	return e.Index, e.Term, nil
+}
+
+// Compact replaces the log's entries up to and including index with a
+// snapshot of the state machine as of index, whose state data holds
+// (§7). Each server compacts on its own, once its state machine has
+// applied index, so index must lie past the current snapshot and at or
+// before lastApplied. The next Ready hands the snapshot, and every entry
+// after it, to storage. Compact keeps a copy of data.
+func (n *Node) Compact(index Index, data []byte) error {
+	if index <= n.log.snapshotIndex() || index > n.lastApplied {
+		return fmt.Errorf("raft: cannot compact through index %d: entries %d to %d are applied and not yet compacted",
+			index, n.log.snapshotIndex()+1, n.lastApplied)
+	}
+	term, _ := n.log.term(index)
+	n.snapshot = &Snapshot{LastIncludedIndex: index, LastIncludedTerm: term, Data: bytes.Clone(data)}
+	n.snapshotUnstable = true
+	// The log holds entry index, so the entries after it stay (Figure 13,
+	// step 6), and storage rewrites them after the snapshot.
+	n.log.restore(n.snapshot)
+	n.unstable = index + 1
+	return nil
 }
 
 // Ready returns the effects produced since the previous call and clears
