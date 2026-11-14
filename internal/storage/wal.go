@@ -22,40 +22,82 @@ var ErrCorrupt = errors.New("storage: corrupt WAL")
 // wal is a write-ahead log of records in segment files in one directory.
 // Each segment is named after the sequence number of its first record,
 // counting from 0 over the whole log. Records are only ever appended, and
-// a new segment begins once the last one has reached segmentSize bytes. A
-// wal is not safe for concurrent use.
+// a new segment begins once the last one has reached segmentSize bytes.
+// The log starts over in a segment that begins with a snapshot record,
+// which replaces every segment before it. A wal is not safe for
+// concurrent use.
 type wal struct {
 	fs          FS
 	dir         string
 	segmentSize int64
 	logger      *slog.Logger // receives the report of a truncated torn record
 
-	file    File   // the last segment, open for appending; nil if there is none
-	name    string // the last segment's file name
-	size    int64  // the last segment's size in bytes
-	nextSeq uint64 // the sequence number of the next record
+	file     File   // the last segment, open for appending; nil if there is none
+	name     string // the last segment's file name
+	size     int64  // the last segment's size in bytes
+	firstSeq uint64 // the sequence number of the log's first record
+	nextSeq  uint64 // the sequence number of the next record
 }
 
 // segmentName returns the file name of the segment whose first record has
 // sequence number seq. The fixed width makes names sort in log order.
 func segmentName(seq uint64) string { return fmt.Sprintf("%016x.wal", seq) }
 
-// open reads every segment in w.dir, in order, handing each record to
-// apply, and leaves w ready to append after the last record. A record
-// that runs past the end of the last segment was torn by a crash before
-// its append could return: open truncates and logs it. Every other flaw
-// is an error wrapping ErrCorrupt, an error from apply among them.
+// tmpSuffix ends the name of a file being written, which becomes a
+// segment or a snapshot only once it is renamed whole.
+const tmpSuffix = ".tmp"
+
+// open reads the log's segments in order, handing each record to apply,
+// and leaves w ready to append after the last record. The log begins at
+// the newest segment that begins with a snapshot record, or else at
+// segment 0; any segment before it is obsolete, left for removal. A
+// record that runs past the end of the last segment was torn by a crash
+// before its append could return: open truncates and logs it. Every other
+// flaw is an error wrapping ErrCorrupt, an error from apply among them.
 func (w *wal) open(apply func(record) error) error {
 	seqs, err := w.segments()
 	if err != nil {
 		return err
 	}
+	data, err := w.readFromStart(seqs)
+	if err != nil {
+		return err
+	}
+	seqs = seqs[len(seqs)-len(data):]
+	if len(seqs) > 0 && startsOver(data[0]) {
+		w.firstSeq, w.nextSeq = seqs[0], seqs[0]
+	}
 	for i, seq := range seqs {
-		if err := w.replay(seq, i == len(seqs)-1, apply); err != nil {
+		if err := w.replay(seq, data[i], i == len(seqs)-1, apply); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// readFromStart returns the contents of the segments the log consists of:
+// those from the newest that starts the log over, or all of them if none
+// does.
+func (w *wal) readFromStart(seqs []uint64) ([][]byte, error) {
+	var data [][]byte
+	for i := len(seqs) - 1; i >= 0; i-- {
+		b, err := w.read(segmentName(seqs[i]))
+		if err != nil {
+			return nil, err
+		}
+		data = append([][]byte{b}, data...)
+		if startsOver(b) {
+			break
+		}
+	}
+	return data, nil
+}
+
+// startsOver reports whether a segment holding b begins with a snapshot
+// record, which starts the log over.
+func startsOver(b []byte) bool {
+	r, _, err := decodeRecord(b)
+	return err == nil && r.typ == recordSnapshot
 }
 
 // segments returns the sequence numbers of the segments in w.dir, in
@@ -69,12 +111,11 @@ func (w *wal) segments() ([]uint64, error) {
 	}
 	var seqs []uint64
 	for _, name := range names {
-		hex, ok := strings.CutSuffix(name, ".wal")
-		if !ok {
+		if !strings.HasSuffix(name, ".wal") {
 			continue
 		}
-		seq, err := strconv.ParseUint(hex, 16, 64)
-		if err != nil || segmentName(seq) != name {
+		seq, ok := parseSegmentName(name)
+		if !ok {
 			return nil, fmt.Errorf("%w: %s in %s is not a segment name", ErrCorrupt, name, w.dir)
 		}
 		seqs = append(seqs, seq)
@@ -82,18 +123,22 @@ func (w *wal) segments() ([]uint64, error) {
 	return seqs, nil
 }
 
-// replay hands each record in segment seq to apply, then opens the
-// segment for appending if it is the last. The segment must begin with
-// the record after the previous segment's last, so a missing or cut-short
-// segment shows as a gap.
-func (w *wal) replay(seq uint64, last bool, apply func(record) error) error {
+// parseSegmentName returns the sequence number segment name is named
+// after, and false if name is not exactly a segment name.
+func parseSegmentName(name string) (uint64, bool) {
+	hex, ok := strings.CutSuffix(name, ".wal")
+	seq, err := strconv.ParseUint(hex, 16, 64)
+	return seq, ok && err == nil && segmentName(seq) == name
+}
+
+// replay hands each record in data, the contents of segment seq, to
+// apply, then opens the segment for appending if it is the last. The
+// segment must begin with the record after the previous segment's last,
+// so a missing or cut-short segment shows as a gap.
+func (w *wal) replay(seq uint64, data []byte, last bool, apply func(record) error) error {
 	name := segmentName(seq)
 	if seq != w.nextSeq {
 		return fmt.Errorf("%w: segment %s should begin with record %d", ErrCorrupt, name, w.nextSeq)
-	}
-	data, err := w.read(name)
-	if err != nil {
-		return err
 	}
 	off := 0
 	for off < len(data) {
@@ -102,7 +147,7 @@ func (w *wal) replay(seq uint64, last bool, apply func(record) error) error {
 			break
 		}
 		if err == nil {
-			err = apply(r)
+			err = w.replayRecord(r, apply)
 		}
 		if err != nil {
 			return fmt.Errorf("%w: segment %s, offset %d: %w", ErrCorrupt, name, off, err)
@@ -114,6 +159,15 @@ func (w *wal) replay(seq uint64, last bool, apply func(record) error) error {
 		return nil
 	}
 	return w.openTail(name, off, len(data))
+}
+
+// replayRecord hands r to apply. A snapshot record is valid only as the
+// first record of the log, the only place startOver writes one.
+func (w *wal) replayRecord(r record, apply func(record) error) error {
+	if r.typ == recordSnapshot && w.nextSeq != w.firstSeq {
+		return errors.New("a snapshot record that does not begin the log")
+	}
+	return apply(r)
 }
 
 // read returns the contents of segment name.
@@ -183,6 +237,66 @@ func (w *wal) append(recs []record) error {
 	}
 	w.size += int64(len(buf))
 	w.nextSeq += uint64(len(recs))
+	return nil
+}
+
+// startOver makes recs, which begin with a snapshot record, the whole
+// log: it writes them to a new segment named after the next record's
+// sequence number, which appears whole or not at all, and appends to it
+// from then on. The segments before it are obsolete, left for removal.
+func (w *wal) startOver(recs []record) error {
+	if err := w.close(); err != nil {
+		return err
+	}
+	var buf []byte
+	for _, r := range recs {
+		buf = appendRecord(buf, r)
+	}
+	name := segmentName(w.nextSeq)
+	if err := writeFileAtomic(w.fs, w.dir, name, buf); err != nil {
+		return err
+	}
+	f, err := w.fs.OpenFile(filepath.Join(w.dir, name), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return fmt.Errorf("storage: open %s: %w", name, err)
+	}
+	w.file, w.name, w.size = f, name, int64(len(buf))
+	w.firstSeq = w.nextSeq
+	w.nextSeq += uint64(len(recs))
+	return nil
+}
+
+// obsolete reports whether name is a segment before the log's first.
+func (w *wal) obsolete(name string) bool {
+	seq, ok := parseSegmentName(name)
+	return ok && seq < w.firstSeq
+}
+
+// writeFileAtomic writes data to a new file name in dir that appears
+// whole or not at all: it writes a temporary file, fsyncs it, renames it
+// to name, and fsyncs dir, so that the rename survives a crash.
+func writeFileAtomic(fsys FS, dir, name string, data []byte) error {
+	tmp := filepath.Join(dir, name+tmpSuffix)
+	f, err := fsys.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("storage: create %s: %w", tmp, err)
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = fsys.Rename(tmp, filepath.Join(dir, name))
+	}
+	if err == nil {
+		err = fsys.SyncDir(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("storage: write %s: %w", name, err)
+	}
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -110,6 +111,7 @@ func readSegments(t *testing.T, dir string) []segmentFile {
 	if err != nil {
 		t.Fatal(err)
 	}
+	names = slices.DeleteFunc(names, func(name string) bool { return !strings.HasSuffix(name, ".wal") })
 	segs := make([]segmentFile, len(names))
 	for i, name := range names {
 		data, err := os.ReadFile(filepath.Join(dir, name))

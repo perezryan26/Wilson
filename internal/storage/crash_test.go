@@ -54,14 +54,14 @@ func crashAt(t *testing.T, n int, seed uint64) bool {
 	if !slices.ContainsFunc(allowed, func(st raft.RestoredState) bool { return sameState(st, got) }) {
 		t.Fatalf("crash point %d, seed %d, after %d Saves returned: recovered %+v, want one of %+v", n, seed, saved, got, allowed)
 	}
-	next := raft.Ready{HardState: hardState(9, 0), Entries: []raft.Entry{ent(raft.Index(len(got.Entries))+1, 9)}}
+	next := raft.Ready{HardState: hardState(9, 0), Entries: []raft.Entry{ent(lastIndex(got)+1, 9)}}
 	if err := s.Save(next); err != nil {
 		t.Fatalf("crash point %d, seed %d: Save after recovery: %v", n, seed, err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := raft.RestoredState{HardState: *next.HardState, Entries: append(got.Entries, next.Entries...)}
+	want := raft.RestoredState{HardState: *next.HardState, Snapshot: got.Snapshot, Entries: append(got.Entries, next.Entries...)}
 	if again := load(t, openFileStorage(t, fsys, "wal")); !sameState(again, want) {
 		t.Fatalf("crash point %d, seed %d: after recovery and one more Save, reopened to %+v, want %+v", n, seed, again, want)
 	}
@@ -80,12 +80,13 @@ func saveUntilError(s *FileStorage, steps []raft.Ready) (int, error) {
 }
 
 // crashDuringRecovery opens file storage on fsys with a crash armed for
-// its first mutating operation, then for its second: the truncation of a
-// torn record and the fsync after it. Each crash leaves the WAL as a crash
-// during recovery would, for the next recovery to handle.
+// its first mutating operation, then for its second, and so on to its
+// fourth: the truncation of a torn record and the fsync after it, and the
+// removals of files a crash left behind. Each crash leaves the disk as a
+// crash during recovery would, for the next recovery to handle.
 func crashDuringRecovery(t *testing.T, fsys *FaultFS) {
 	t.Helper()
-	for m := 1; m <= 2; m++ {
+	for m := 1; m <= 4; m++ {
 		fsys.CrashAfter(m)
 		s, err := OpenFileStorage(fsys, "wal", FileOptions{SegmentSize: 64, Logger: slog.New(slog.DiscardHandler)})
 		fsys.CrashAfter(0)
@@ -104,7 +105,7 @@ func crashDuringRecovery(t *testing.T, fsys *FaultFS) {
 // one, crashed: the state after steps[:saved], then that state with each
 // longer prefix of the crashed Save's records, which file storage writes
 // in this order: the hard state, a truncation if the entries overwrite
-// stored ones, then each entry.
+// stored ones, then each entry. A Save with a snapshot is all or nothing.
 func allowedStates(steps []raft.Ready, saved int) []raft.RestoredState {
 	var mem Memory
 	for _, rd := range steps[:saved] {
@@ -116,12 +117,17 @@ func allowedStates(steps []raft.Ready, saved int) []raft.RestoredState {
 		return states
 	}
 	rd := steps[saved]
+	if rd.Snapshot != nil {
+		_ = mem.Save(rd)
+		after, _ := mem.Load()
+		return append(states, after)
+	}
 	if rd.HardState != nil {
 		st.HardState = *rd.HardState
 		states = append(states, st)
 	}
-	if len(rd.Entries) > 0 && rd.Entries[0].Index <= raft.Index(len(st.Entries)) {
-		st.Entries = slices.Clone(st.Entries[:rd.Entries[0].Index-1])
+	if len(rd.Entries) > 0 && rd.Entries[0].Index <= lastIndex(st) {
+		st.Entries = slices.Clone(st.Entries[:rd.Entries[0].Index-snapshotIndex(st.Snapshot)-1])
 		states = append(states, st)
 	}
 	for _, e := range rd.Entries {
