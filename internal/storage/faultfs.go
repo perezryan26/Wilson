@@ -20,18 +20,29 @@ var ErrCrashed = errors.New("storage: simulated crash")
 // tests and the simulator. A crash keeps what was synced and a random
 // part of the rest, as a power failure would: a prefix of each file's
 // writes and truncations since its last Sync, the last write possibly cut
-// short mid-record, and a prefix of the files created since their
-// directory's last SyncDir. All its randomness comes from the source
-// NewFaultFS is given, so a seed replays a crash exactly. It supports
-// what file storage does: creating files, appending to them, truncating,
-// reading them whole, listing, and syncing. A FaultFS is not safe for
-// concurrent use.
+// short mid-record, and a prefix of the creations, renames, and removals
+// since their directory's last SyncDir. All its randomness comes from the
+// source NewFaultFS is given, so a seed replays a crash exactly. It
+// supports what file storage does: creating files, appending to them,
+// truncating, reading them whole, renaming within a directory, removing,
+// listing, and syncing. A FaultFS is not safe for concurrent use.
 type FaultFS struct {
 	rand    *rand.Rand
 	files   map[string]*faultFile // every file, by path
-	created []string              // files created since their directory's last SyncDir, oldest first
+	dirOps  []dirOp               // changes to directories since their last SyncDir, oldest first
 	crashIn int                   // mutating operations left until a crash; 0 for none
 	boot    int                   // crashes so far; files opened in an earlier boot are dead
+}
+
+// dirOp is a creation, rename, or removal: the directory entries it
+// changed, each with the file it named before, so that a crash can undo
+// it.
+type dirOp []dirEntry
+
+// dirEntry is a path and the file it names, nil for none.
+type dirEntry struct {
+	path string
+	file *faultFile
 }
 
 // faultFile is one file: what is durable, and the writes and truncations
@@ -56,20 +67,22 @@ func NewFaultFS(r *rand.Rand) *FaultFS {
 }
 
 // CrashAfter makes the file system crash during the nth mutating
-// operation from now: a write, truncation, file creation, fsync, or
-// directory fsync. That operation returns ErrCrashed, and how much of it
-// and of everything unsynced before it lasts is left to chance, as in a
-// real crash. n = 0 cancels a pending crash.
+// operation from now: a write, truncation, file creation, rename,
+// removal, fsync, or directory fsync. That operation returns ErrCrashed,
+// and how much of it and of everything unsynced before it lasts is left
+// to chance, as in a real crash. n = 0 cancels a pending crash.
 func (f *FaultFS) CrashAfter(n int) { f.crashIn = n }
 
 // Crash crashes the file system now: it keeps what was synced and a
 // random prefix of the rest, and files opened before it become unusable.
 func (f *FaultFS) Crash() {
-	keep := f.rand.IntN(len(f.created) + 1)
-	for _, path := range f.created[keep:] {
-		delete(f.files, path)
+	keep := f.rand.IntN(len(f.dirOps) + 1)
+	for i := len(f.dirOps) - 1; i >= keep; i-- {
+		for _, was := range f.dirOps[i] {
+			f.set(was)
+		}
 	}
-	f.created = nil
+	f.dirOps = nil
 	for _, path := range slices.Sorted(maps.Keys(f.files)) {
 		f.files[path].crash(f.rand)
 	}
@@ -119,9 +132,55 @@ func (f *FaultFS) open(path string, flag int) (*faultFile, error) {
 		return nil, fs.ErrNotExist
 	}
 	file = &faultFile{}
-	f.files[path] = file
-	f.created = append(f.created, path)
+	f.change(dirEntry{path, file})
 	return file, f.mutated()
+}
+
+// change makes each entry's path name its file, and records what they
+// named before for a crash to restore.
+func (f *FaultFS) change(entries ...dirEntry) {
+	op := make(dirOp, len(entries))
+	for i, e := range entries {
+		op[i] = dirEntry{e.path, f.files[e.path]}
+	}
+	for _, e := range entries {
+		f.set(e)
+	}
+	f.dirOps = append(f.dirOps, op)
+}
+
+// set makes e's path name e's file, or nothing if that is nil.
+func (f *FaultFS) set(e dirEntry) {
+	if e.file == nil {
+		delete(f.files, e.path)
+		return
+	}
+	f.files[e.path] = e.file
+}
+
+// Rename makes newpath name the file oldpath names, replacing any file
+// there. Both must be in one directory.
+func (f *FaultFS) Rename(oldpath, newpath string) error {
+	oldpath, newpath = filepath.Clean(oldpath), filepath.Clean(newpath)
+	file, ok := f.files[oldpath]
+	switch {
+	case filepath.Dir(oldpath) != filepath.Dir(newpath):
+		return &fs.PathError{Op: "rename", Path: oldpath, Err: errors.ErrUnsupported}
+	case !ok:
+		return &fs.PathError{Op: "rename", Path: oldpath, Err: fs.ErrNotExist}
+	}
+	f.change(dirEntry{oldpath, nil}, dirEntry{newpath, file})
+	return f.mutated()
+}
+
+// Remove removes the file name.
+func (f *FaultFS) Remove(name string) error {
+	path := filepath.Clean(name)
+	if _, ok := f.files[path]; !ok {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	f.change(dirEntry{path, nil})
+	return f.mutated()
 }
 
 // ReadDir returns the names of the files in dir, sorted.
@@ -136,13 +195,13 @@ func (f *FaultFS) ReadDir(dir string) ([]string, error) {
 	return names, nil
 }
 
-// SyncDir makes the creation of every file in dir durable.
+// SyncDir makes every creation, rename, and removal in dir durable.
 func (f *FaultFS) SyncDir(dir string) error {
 	if err := f.mutated(); err != nil {
 		return err
 	}
-	f.created = slices.DeleteFunc(f.created, func(path string) bool {
-		return filepath.Dir(path) == filepath.Clean(dir)
+	f.dirOps = slices.DeleteFunc(f.dirOps, func(op dirOp) bool {
+		return filepath.Dir(op[0].path) == filepath.Clean(dir)
 	})
 	return nil
 }

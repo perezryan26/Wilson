@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -149,5 +150,74 @@ func TestFaultFSCrashAfterCountsMutations(t *testing.T) {
 	}
 	if got := readFault(t, fsys, "d/a"); !slices.Contains([]string{"hello", "he"}, string(got)) {
 		t.Errorf("after a crash during a truncation the file holds %q, want %q or %q", got, "hello", "he")
+	}
+}
+
+// listing describes every file in d on fsys as name=contents.
+func listing(t *testing.T, fsys *FaultFS) string {
+	t.Helper()
+	names, err := fsys.ReadDir("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, name := range names {
+		files = append(files, name+"="+string(readFault(t, fsys, "d/"+name)))
+	}
+	return strings.Join(files, " ")
+}
+
+// renameAndRemove creates files a, b, and c in d, renames a over b and
+// removes c, syncing the directory if sync is set, then crashes and
+// returns what d holds.
+func renameAndRemove(t *testing.T, seed uint64, sync bool) string {
+	t.Helper()
+	fsys := newFaultFS(seed)
+	for _, name := range []string{"a", "b", "c"} {
+		createSynced(t, fsys, "d/"+name, []byte(strings.ToUpper(name)))
+	}
+	steps := []func() error{
+		func() error { return fsys.Rename("d/a", "d/b") },
+		func() error { return fsys.Remove("d/c") },
+	}
+	if sync {
+		steps = append(steps, func() error { return fsys.SyncDir("d") })
+	}
+	for _, step := range steps {
+		if err := step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fsys.Crash()
+	return listing(t, fsys)
+}
+
+// A rename or removal since its directory's last SyncDir may be undone by
+// a crash, which keeps such changes only in the order they happened: here
+// none, the rename that replaced b, or both. Once SyncDir returns, they
+// survive every crash. Each counts as a mutating operation.
+func TestFaultFSUnsyncedRenameAndRemoveMayBeUndone(t *testing.T) {
+	outcomes := map[string]int{}
+	for seed := range uint64(100) {
+		got := renameAndRemove(t, seed, false)
+		if !slices.Contains([]string{"a=A b=B c=C", "b=A c=C", "b=A"}, got) {
+			t.Fatalf("seed %d: after the crash the directory holds %s", seed, got)
+		}
+		outcomes[got]++
+		if got := renameAndRemove(t, seed, true); got != "b=A" {
+			t.Fatalf("seed %d: after SyncDir and a crash the directory holds %s, want b=A", seed, got)
+		}
+	}
+	if len(outcomes) != 3 {
+		t.Errorf("crashes left %v; want each of the three prefixes", outcomes)
+	}
+	fsys := newFaultFS(1)
+	createSynced(t, fsys, "d/a", nil)
+	fsys.CrashAfter(2)
+	if err := fsys.Rename("d/a", "d/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Remove("d/b"); !errors.Is(err, ErrCrashed) {
+		t.Errorf("Remove as the second mutating operation: error %v, want ErrCrashed", err)
 	}
 }

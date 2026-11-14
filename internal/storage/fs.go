@@ -15,9 +15,15 @@ type FS interface {
 	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
 	// ReadDir returns the names of the entries in dir, sorted.
 	ReadDir(dir string) ([]string, error)
-	// SyncDir makes dir's entries durable. A file created in dir survives a
-	// crash only once SyncDir has returned, even if its contents were
-	// synced.
+	// Rename makes newpath name the file that oldpath names, replacing
+	// any file newpath named, as os.Rename does. Both paths are in one
+	// directory.
+	Rename(oldpath, newpath string) error
+	// Remove removes the file name.
+	Remove(name string) error
+	// SyncDir makes dir's entries durable. A file created, renamed, or
+	// removed in dir has that change survive a crash only once SyncDir
+	// has returned, even if its contents were synced.
 	SyncDir(dir string) error
 }
 
@@ -58,6 +64,12 @@ func (OSFS) ReadDir(dir string) ([]string, error) {
 	}
 	return names, nil
 }
+
+// Rename calls os.Rename.
+func (OSFS) Rename(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }
+
+// Remove calls os.Remove.
+func (OSFS) Remove(name string) error { return os.Remove(name) }
 
 // SyncDir opens dir and fsyncs it.
 func (OSFS) SyncDir(dir string) error {

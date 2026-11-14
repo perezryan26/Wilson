@@ -65,3 +65,31 @@ func TestOSFSOpenErrors(t *testing.T) {
 		t.Errorf("opening a missing file gave %v, %v; want nil and fs.ErrNotExist", missing, err)
 	}
 }
+
+// OSFS renames a file over another, which it replaces, and removes files,
+// refusing to remove one that does not exist.
+func TestOSFSRenamesAndRemoves(t *testing.T) {
+	var fsys FS = OSFS{}
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	for name, data := range map[string]string{a: "A", b: "B"} {
+		if err := os.WriteFile(name, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fsys.Rename(a, b); err != nil {
+		t.Fatal(err)
+	}
+	if names, err := fsys.ReadDir(dir); err != nil || !slices.Equal(names, []string{"b"}) {
+		t.Errorf("after the rename ReadDir = %q, %v; want [b]", names, err)
+	}
+	if got, err := os.ReadFile(b); err != nil || string(got) != "A" {
+		t.Errorf("b holds %q, %v; want %q", got, err, "A")
+	}
+	if err := fsys.Remove(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Remove(b); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("removing a missing file: error %v, want fs.ErrNotExist", err)
+	}
+}
