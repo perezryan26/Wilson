@@ -466,10 +466,10 @@ func TestInstallSnapshotDropsChunksThatDoNotContinue(t *testing.T) {
 	wantSnapshot(t, n.Ready(), snapshotOf(5, 2))
 }
 
-// transfer delivers messages between leader n and follower f, in send
+// catchUp delivers messages between leader n and follower f, in send
 // order, until none are left, dropping those to anyone else, and returns
 // the snapshot chunks f received.
-func transfer(t *testing.T, n, f *Node) []InstallSnapshotRequest {
+func catchUp(t *testing.T, n, f *Node) []InstallSnapshotRequest {
 	t.Helper()
 	var chunks []InstallSnapshotRequest
 	queue := append(n.Ready().Messages, f.Ready().Messages...)
@@ -504,7 +504,7 @@ func TestSnapshotTravelsInChunks(t *testing.T) {
 		for range n.heartbeatTick {
 			n.Tick()
 		}
-		chunks := transfer(t, n, f)
+		chunks := catchUp(t, n, f)
 		if len(chunks) != want || !chunks[len(chunks)-1].Done {
 			t.Errorf("chunk size %d: sent %d chunks, the last done: %t; want %d", size, len(chunks), len(chunks) > 0 && chunks[len(chunks)-1].Done, want)
 		}
@@ -538,8 +538,8 @@ func wantChunk(t *testing.T, what string, rd Ready, index Index, offset int) {
 // took the last one. A reply that does not, a repeat or one from a
 // follower that lost what it held, waits for the next heartbeat to resend
 // from where the follower is, so duplicated replies never start a second
-// stream of chunks. Compacting again starts the transfer of the new
-// snapshot from its first byte.
+// stream of chunks. Compacting again leaves the transfer under way alone:
+// the follower gets the new snapshot once it has the old one.
 func TestLeaderSendsNextChunkOnProgress(t *testing.T) {
 	n := leaderWithSnapshot(t)
 	n.snapshotChunkSize = 3
@@ -577,5 +577,62 @@ func TestLeaderSendsNextChunkOnProgress(t *testing.T) {
 	for range n.heartbeatTick {
 		n.Tick()
 	}
-	wantChunk(t, "after compacting again", n.Ready(), 8, 0)
+	wantChunk(t, "after compacting again", n.Ready(), 5, 3)
+	done5 := Message{From: 2, To: 1, InstallSnapshotResponse: &InstallSnapshotResponse{Term: 3, LastIncludedIndex: 5, Done: true}}
+	n.Step(done5)
+	wantChunk(t, "once the old snapshot is in", n.Ready(), 8, 0)
+	n.Step(progressFrom(8, 3))
+	wantChunk(t, "after progress with the new snapshot", n.Ready(), 8, 3)
+	// A late repeat of the old snapshot's last reply ends nothing.
+	n.Step(done5)
+	n.Ready()
+	for range n.heartbeatTick {
+		n.Tick()
+	}
+	wantChunk(t, "after a repeated reply about the old snapshot", n.Ready(), 8, 3)
+}
+
+// compactAnother has leader n, with server 3 up to date, commit one more
+// entry and compact its log through it.
+func compactAnother(t *testing.T, n *Node) {
+	t.Helper()
+	if _, _, err := n.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	n.Step(appendResponse(3, 3, true, n.log.lastIndex()))
+	n.Ready()
+	if err := n.Compact(n.lastApplied, fmt.Appendf(nil, "state@%d", n.lastApplied)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A transfer ends however often the leader compacts: it sends the
+// snapshot it began with to the end. Here the leader compacts between
+// each chunk and the reply to it, and the follower still holds the
+// 7-byte snapshot after its four 2-byte chunks. Starting over with each
+// new snapshot, the leader kept a lagging follower from ever catching up
+// in the randomized simulator.
+func TestSnapshotTransferOutlastsCompaction(t *testing.T) {
+	n := leaderWithSnapshot(t)
+	n.snapshotChunkSize = 2
+	n.Step(appendResponse(3, 3, true, 7))
+	f := NewNode(testConfig(2, 3, 1), RestoredState{})
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: 1}})
+	for chunks := 0; f.snapshot == nil; chunks++ {
+		if chunks == 4 {
+			t.Fatal("the follower has no snapshot after four chunks")
+		}
+		for _, m := range sentTo(n.Ready(), 2) {
+			f.Step(m)
+		}
+		replies := f.Ready().Messages
+		compactAnother(t, n)
+		n.Ready()
+		for _, m := range replies {
+			n.Step(m)
+		}
+	}
+	if f.snapshot.LastIncludedIndex != 5 || string(f.snapshot.Data) != "state@5" {
+		t.Errorf("the follower holds %+v, want the snapshot the transfer began with", f.snapshot)
+	}
 }

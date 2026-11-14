@@ -1,22 +1,39 @@
 package raft
 
-// sendSnapshot sends server the next chunk of the snapshot, because the
+// transfer is a snapshot on its way to a follower in chunks (Figure 13),
+// and how many of its bytes the follower is known to hold.
+type transfer struct {
+	snapshot *Snapshot
+	offset   int
+}
+
+// sendSnapshot sends server the next chunk of a snapshot, because the
 // leader has replaced the entries the server needs next (§7). The chunk
 // begins where the server's copy is known to end, and holds at most
 // snapshotChunkSize bytes, or the rest of the snapshot if that is 0.
 func (n *Node) sendSnapshot(to NodeID) {
-	s, offset := n.snapshot, n.snapshotOffset[to]
+	tr := n.transfers[to]
+	if tr == nil {
+		// A transfer sends the latest snapshot and keeps sending that one
+		// until it is done, even if the leader compacts again meanwhile.
+		// Starting over with each new snapshot would let a leader that
+		// compacts more often than a transfer takes keep a follower from
+		// ever catching up.
+		tr = &transfer{snapshot: n.snapshot}
+		n.transfers[to] = tr
+	}
+	s := tr.snapshot
 	end := len(s.Data)
 	if n.snapshotChunkSize > 0 {
-		end = min(end, offset+n.snapshotChunkSize)
+		end = min(end, tr.offset+n.snapshotChunkSize)
 	}
 	n.send(Message{To: to, InstallSnapshot: &InstallSnapshotRequest{
 		Term:              n.currentTerm,
 		LeaderID:          n.id,
 		LastIncludedIndex: s.LastIncludedIndex,
 		LastIncludedTerm:  s.LastIncludedTerm,
-		Offset:            offset,
-		Data:              s.Data[offset:end],
+		Offset:            tr.offset,
+		Data:              s.Data[tr.offset:end],
 		Done:              end == len(s.Data),
 	}})
 }
@@ -123,21 +140,31 @@ func (n *Node) handleInstallSnapshotResponse(from NodeID, resp *InstallSnapshotR
 	if n.role != Leader || resp.Term != n.currentTerm {
 		return
 	}
-	if resp.Done {
-		n.acknowledge(from, resp.LastIncludedIndex)
+	if !resp.Done {
+		n.advanceTransfer(from, resp)
 		return
 	}
+	// A transfer of this snapshot, or of an older one, has nothing left to
+	// give the follower.
+	if tr := n.transfers[from]; tr != nil && tr.snapshot.LastIncludedIndex <= resp.LastIncludedIndex {
+		delete(n.transfers, from)
+	}
+	n.acknowledge(from, resp.LastIncludedIndex)
+}
+
+// advanceTransfer records how much of the snapshot being sent to a
+// follower it holds. A reply that moves the transfer forward gets the next
+// chunk at once. Any other waits for the next heartbeat, so a duplicated
+// reply never starts a second stream of chunks.
+func (n *Node) advanceTransfer(from NodeID, resp *InstallSnapshotResponse) {
+	tr := n.transfers[from]
 	// A reply about another snapshot answers an earlier transfer.
-	s := n.snapshot
-	if s == nil || resp.LastIncludedIndex != s.LastIncludedIndex || resp.Offset > len(s.Data) {
+	if tr == nil || resp.LastIncludedIndex != tr.snapshot.LastIncludedIndex || resp.Offset > len(tr.snapshot.Data) {
 		return
 	}
-	prev := n.snapshotOffset[from]
-	n.snapshotOffset[from] = resp.Offset
-	// A reply that moves the transfer forward gets the next chunk at once.
-	// Any other waits for the next heartbeat, so a duplicated reply never
-	// starts a second stream of chunks.
-	if resp.Offset > prev && n.nextIndex[from] <= s.LastIncludedIndex {
+	prev := tr.offset
+	tr.offset = resp.Offset
+	if resp.Offset > prev && n.nextIndex[from] <= n.log.snapshotIndex() {
 		n.sendSnapshot(from)
 	}
 }

@@ -139,9 +139,9 @@ type Node struct {
 	lastApplied Index
 
 	// Volatile state on leaders, reinitialized after each election.
-	nextIndex      map[NodeID]Index // the next log index to send each server
-	matchIndex     map[NodeID]Index // the highest index known replicated on each server
-	snapshotOffset map[NodeID]int   // how many snapshot bytes each server is known to hold, while it is sent the snapshot
+	nextIndex  map[NodeID]Index     // the next log index to send each server
+	matchIndex map[NodeID]Index     // the highest index known replicated on each server
+	transfers  map[NodeID]*transfer // the snapshot each server is being sent, if any
 
 	// The snapshot a follower is receiving in chunks (Figure 13, steps
 	// 2–4): the bytes so far, and the term of the leader sending them.
@@ -276,9 +276,6 @@ func (n *Node) Compact(index Index, data []byte) error {
 	// step 6), and storage rewrites them after the snapshot.
 	n.log.restore(n.snapshot)
 	n.unstable = index + 1
-	// A leader sending the old snapshot starts the new one from its first
-	// byte.
-	clear(n.snapshotOffset)
 	return nil
 }
 
@@ -357,7 +354,7 @@ func (n *Node) becomeLeader() {
 	n.leader = n.id
 	n.nextIndex = map[NodeID]Index{}
 	n.matchIndex = map[NodeID]Index{}
-	n.snapshotOffset = map[NodeID]int{}
+	n.transfers = map[NodeID]*transfer{}
 	for _, id := range n.peers {
 		n.nextIndex[id] = n.log.lastIndex() + 1
 	}
