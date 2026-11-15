@@ -352,7 +352,8 @@ func TestStopDuringTraffic(t *testing.T) {
 type events struct {
 	mu   sync.Mutex
 	list []string
-	fail bool // makes every Save fail
+	fail bool          // makes every Save fail
+	hold chan struct{} // if not nil, a Save with entries waits until it is closed
 }
 
 func (ev *events) add(e string) {
@@ -387,6 +388,9 @@ func (r *recorder) Save(rd raft.Ready) error {
 	for _, e := range rd.Entries {
 		r.add(fmt.Sprintf("save entry %d", e.Index))
 	}
+	if r.hold != nil && len(rd.Entries) > 0 {
+		<-r.hold
+	}
 	return r.mem.Save(rd)
 }
 
@@ -405,14 +409,14 @@ func (r *recorder) Apply(e raft.Entry)        { r.add(fmt.Sprintf("apply %d", e.
 func (r *recorder) Snapshot() ([]byte, error) { return nil, nil }
 func (r *recorder) Restore([]byte) error      { return nil }
 
-// startRecorded starts server 1 of a cluster of three on a recorder, with
-// a tick so long that it never ticks: the test plays its peers.
-func startRecorded(t *testing.T, ev *events) *node.Node {
+// startRecorded starts server 1 of a cluster of peers on a recorder. With
+// a tick of an hour it never ticks, and the test plays its peers.
+func startRecorded(t *testing.T, ev *events, peers []raft.NodeID, tick time.Duration) *node.Node {
 	t.Helper()
 	cfg, _ := raft.DefaultConfig()
-	cfg.ID, cfg.Peers, cfg.Rand = 1, []raft.NodeID{1, 2, 3}, rand.New(rand.NewPCG(1, 1))
+	cfg.ID, cfg.Peers, cfg.Rand = 1, peers, rand.New(rand.NewPCG(1, 1))
 	r := &recorder{events: ev}
-	n, err := node.Start(node.Config{Raft: cfg, Tick: time.Hour}, r, r, r)
+	n, err := node.Start(node.Config{Raft: cfg, Tick: tick}, r, r, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +431,7 @@ func startRecorded(t *testing.T, ev *events) *node.Node {
 func TestNodeSavesBeforeItSendsAndApplies(t *testing.T) {
 	leaktest.Check(t)
 	ev := &events{}
-	n := startRecorded(t, ev)
+	n := startRecorded(t, ev, []raft.NodeID{1, 2, 3}, time.Hour)
 	n.Step(raft.Message{From: 2, To: 1, RequestVote: &raft.RequestVoteRequest{Term: 1, CandidateID: 2}})
 	n.Step(raft.Message{From: 2, To: 1, AppendEntries: &raft.AppendEntriesRequest{
 		Term: 1, LeaderID: 2, Entries: []raft.Entry{{Index: 1, Term: 1, Data: []byte("x")}}, LeaderCommit: 1,
@@ -445,7 +449,7 @@ func TestNodeSavesBeforeItSendsAndApplies(t *testing.T) {
 func TestNodeStopsForGoodOnStorageError(t *testing.T) {
 	leaktest.Check(t)
 	ev := &events{fail: true}
-	n := startRecorded(t, ev)
+	n := startRecorded(t, ev, []raft.NodeID{1, 2, 3}, time.Hour)
 	n.Step(raft.Message{From: 2, To: 1, RequestVote: &raft.RequestVoteRequest{Term: 1, CandidateID: 2}})
 	select {
 	case <-n.Done():
@@ -464,5 +468,32 @@ func TestNodeStopsForGoodOnStorageError(t *testing.T) {
 	n.Step(raft.Message{From: 2, To: 1, RequestVote: &raft.RequestVoteRequest{Term: 2, CandidateID: 2}})
 	if got := ev.get(); !slices.Equal(got, []string{"save failed"}) {
 		t.Errorf("the node did %v, want only the failed save", got)
+	}
+}
+
+// Propose answers only once the new entry is saved, so a caller never
+// learns of an entry this server could lose in a crash. The save of the
+// entry is held until the test lets it finish.
+func TestProposeReturnsOnceTheEntryIsSaved(t *testing.T) {
+	leaktest.Check(t)
+	ev := &events{hold: make(chan struct{})}
+	n := startRecorded(t, ev, []raft.NodeID{1}, time.Millisecond)
+	release := sync.OnceFunc(func() { close(ev.hold) })
+	t.Cleanup(release)
+	waitFor(t, "the only server to lead", func() bool { return n.Status().Role == raft.Leader })
+	returned := make(chan error, 1)
+	go func() {
+		_, _, err := n.Propose(context.Background(), []byte("x"))
+		returned <- err
+	}()
+	waitFor(t, "the entry's save to begin", func() bool { return slices.Contains(ev.get(), "save entry 1") })
+	select {
+	case err := <-returned:
+		t.Fatalf("Propose returned %v while its entry was still being saved", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-returned; err != nil {
+		t.Fatal(err)
 	}
 }
