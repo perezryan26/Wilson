@@ -233,13 +233,37 @@ func TestLeaderSkipsConflictingTerm(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n := newLeaderWithLog(t, 4, 1, 1, 3, 3)
 			n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{
-				Term: 4, ConflictTerm: tt.conflictTerm, ConflictIndex: tt.conflictIndex,
+				Term: 4, PrevLogIndex: 4, ConflictTerm: tt.conflictTerm, ConflictIndex: tt.conflictIndex,
 			}})
 			req := oneAppend(t, n.Ready(), 2)
 			if req.PrevLogIndex != tt.prev || len(req.Entries) != int(4-tt.prev) {
 				t.Errorf("retry after entry %d with %d entries, want after entry %d", req.PrevLogIndex, len(req.Entries), tt.prev)
 			}
 		})
+	}
+}
+
+// ADR-0004: a rejection names the probe it answers, and the leader acts
+// only on a rejection of its latest probe. A heartbeat and a proposal
+// both probed at entry 7, and a follower whose log ends at the
+// snapshot's last entry, 5, refused both. The first rejection moves the
+// probe to entry 5. The second is stale: acting on it would move
+// nextIndex into the snapshot and send a snapshot the follower does not
+// need. The randomized simulator found this in seed 31.
+func TestLeaderIgnoresStaleRejection(t *testing.T) {
+	n := leaderWithSnapshot(t)
+	reject := Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: 6}}
+	n.Step(reject)
+	if req := oneAppend(t, n.Ready(), 2); req.PrevLogIndex != 5 || len(req.Entries) != 2 {
+		t.Fatalf("after the first rejection, sent %d entries after entry %d, want entries 6 and 7 after entry 5",
+			len(req.Entries), req.PrevLogIndex)
+	}
+	n.Step(reject)
+	if sent := sentTo(n.Ready(), 2); len(sent) != 0 {
+		t.Errorf("a stale rejection made the leader send %+v", sent)
+	}
+	if n.nextIndex[2] != 6 {
+		t.Errorf("nextIndex[2] = %d, want 6", n.nextIndex[2])
 	}
 }
 
@@ -253,9 +277,9 @@ func TestRejectionNamesConflict(t *testing.T) {
 		prevTerm  Term
 		want      AppendEntriesResponse
 	}{
-		{"no entry at prevLogIndex", 7, 3, AppendEntriesResponse{Term: 3, ConflictIndex: 6}},
-		{"term 2 where the leader has 3", 4, 3, AppendEntriesResponse{Term: 3, ConflictTerm: 2, ConflictIndex: 3}},
-		{"term 1 where the leader has 2", 2, 2, AppendEntriesResponse{Term: 3, ConflictTerm: 1, ConflictIndex: 1}},
+		{"no entry at prevLogIndex", 7, 3, AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: 6}},
+		{"term 2 where the leader has 3", 4, 3, AppendEntriesResponse{Term: 3, PrevLogIndex: 4, ConflictTerm: 2, ConflictIndex: 3}},
+		{"term 1 where the leader has 2", 2, 2, AppendEntriesResponse{Term: 3, PrevLogIndex: 2, ConflictTerm: 1, ConflictIndex: 1}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

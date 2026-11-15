@@ -107,8 +107,8 @@ func describe(m raft.Message) string {
 		if r.Success {
 			return fmt.Sprintf("AppendEntriesResponse term=%d success=true matchIndex=%d", r.Term, r.MatchIndex)
 		}
-		return fmt.Sprintf("AppendEntriesResponse term=%d success=false conflictTerm=%d conflictIndex=%d",
-			r.Term, r.ConflictTerm, r.ConflictIndex)
+		return fmt.Sprintf("AppendEntriesResponse term=%d success=false prevLogIndex=%d conflictTerm=%d conflictIndex=%d",
+			r.Term, r.PrevLogIndex, r.ConflictTerm, r.ConflictIndex)
 	case m.InstallSnapshot != nil:
 		r := m.InstallSnapshot
 		return fmt.Sprintf("InstallSnapshot term=%d leaderId=%d lastIncludedIndex=%d lastIncludedTerm=%d offset=%d bytes=%d done=%t",

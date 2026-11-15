@@ -248,7 +248,7 @@ func sentTo(rd Ready, to NodeID) []Message {
 // 2 rejects an AppendEntries because its log ends at logEnd.
 func rejectedBy(t *testing.T, n *Node, logEnd Index) Message {
 	t.Helper()
-	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: logEnd + 1}})
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: logEnd + 1}})
 	sent := sentTo(n.Ready(), 2)
 	if len(sent) != 1 {
 		t.Fatalf("log ending at %d: sent %+v, want one message", logEnd, sent)
@@ -278,7 +278,7 @@ func TestLeaderSendsSnapshotWhenEntriesAreGone(t *testing.T) {
 // the snapshot and sends the entries after it.
 func TestLeaderResendsSnapshotUntilAcknowledged(t *testing.T) {
 	n := leaderWithSnapshot(t)
-	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: 1}})
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: 1}})
 	for heartbeat := range 3 {
 		if sent := sentTo(n.Ready(), 2); len(sent) != 1 || sent[0].InstallSnapshot == nil {
 			t.Fatalf("heartbeat %d: sent server 2 %+v, want one InstallSnapshot", heartbeat, sent)
@@ -543,7 +543,7 @@ func wantChunk(t *testing.T, what string, rd Ready, index Index, offset int) {
 func TestLeaderSendsNextChunkOnProgress(t *testing.T) {
 	n := leaderWithSnapshot(t)
 	n.snapshotChunkSize = 3
-	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: 1}})
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: 1}})
 	wantChunk(t, "after the rejection", n.Ready(), 5, 0)
 	n.Step(progressFrom(5, 3))
 	wantChunk(t, "after progress", n.Ready(), 5, 3)
@@ -617,7 +617,7 @@ func TestSnapshotTransferOutlastsCompaction(t *testing.T) {
 	n.snapshotChunkSize = 2
 	n.Step(appendResponse(3, 3, true, 7))
 	f := NewNode(testConfig(2, 3, 1), RestoredState{})
-	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, ConflictIndex: 1}})
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 3, PrevLogIndex: 7, ConflictIndex: 1}})
 	for chunks := 0; f.snapshot == nil; chunks++ {
 		if chunks == 4 {
 			t.Fatal("the follower has no snapshot after four chunks")

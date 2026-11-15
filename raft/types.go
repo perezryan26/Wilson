@@ -117,6 +117,13 @@ type AppendEntriesResponse struct {
 	// so the leader cannot assume a reply answers what it last sent.
 	MatchIndex Index
 
+	// PrevLogIndex is, on a rejection for a log inconsistency, the
+	// PrevLogIndex of the request refused: the probe of the follower's
+	// log that the rejection answers. The leader acts only on a rejection
+	// of its latest probe, because one answering an earlier probe could
+	// back nextIndex up past entries the follower holds.
+	PrevLogIndex Index
+
 	// ConflictTerm and ConflictIndex say, on a rejection for a log
 	// inconsistency, where the logs part, so the leader can skip a whole
 	// conflicting term per round trip (§5.3;

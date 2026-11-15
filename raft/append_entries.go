@@ -104,7 +104,7 @@ func (n *Node) rejectAppend(to NodeID) {
 // lacks or holds with another term, and says where the logs part
 // (docs/adr/0004-fast-log-backtracking.md).
 func (n *Node) rejectConflict(to NodeID, prevIndex Index) {
-	resp := &AppendEntriesResponse{Term: n.currentTerm, ConflictIndex: n.log.lastIndex() + 1}
+	resp := &AppendEntriesResponse{Term: n.currentTerm, PrevLogIndex: prevIndex, ConflictIndex: n.log.lastIndex() + 1}
 	if prevIndex <= n.log.lastIndex() {
 		resp.ConflictTerm, _ = n.log.term(prevIndex)
 		resp.ConflictIndex = n.log.firstIndexOf(resp.ConflictTerm, prevIndex)
@@ -124,8 +124,15 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	}
 	if !resp.Success {
 		// The follower's log lacks or contradicts the entry at PrevLogIndex
-		// (§5.3). Back up past the whole conflict, but always by at least
-		// one entry, so even an odd reply cannot stall the search, and never
+		// (§5.3). A rejection of an earlier probe than the latest, at
+		// nextIndex - 1, is stale: acting on it again could back up past
+		// entries the follower holds, as far as into the snapshot, and send
+		// a snapshot it does not need.
+		if resp.PrevLogIndex != n.nextIndex[from]-1 {
+			return
+		}
+		// Back up past the whole conflict, but always by at least one
+		// entry, so even an odd reply cannot stall the search, and never
 		// to entries the follower is known to hold.
 		next := min(n.nextIndex[from]-1, n.backtrack(resp))
 		n.nextIndex[from] = max(next, n.matchIndex[from]+1)

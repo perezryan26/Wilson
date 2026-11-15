@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-03
+- Amended: 2026-11-14, rejections name the probe they answer
 
 ## Context
 
@@ -13,19 +14,20 @@ The details matter here because messages are one-way (ADR-0002). A reply can arr
 
 ## Decision
 
-`AppendEntriesResponse` carries three fields beyond Figure 2's `Term` and `Success`.
+`AppendEntriesResponse` carries four fields beyond Figure 2's `Term` and `Success`.
 
 - **`MatchIndex`**, on success: `PrevLogIndex + len(Entries)` of the request being answered. The leader raises the follower's `matchIndex` to it and sets `nextIndex` to one past it, but never lowers `matchIndex`. It is not the follower's last index, because entries after the request's may still conflict with the leader's.
+- **`PrevLogIndex`**, on a rejection at step 2: the request's `PrevLogIndex`. It names the probe of the follower's log that the rejection answers.
 - **`ConflictTerm`** and **`ConflictIndex`**, on a rejection at step 2 (no entry at `PrevLogIndex`, or one of another term):
   - If the follower has no entry at `PrevLogIndex`: `ConflictTerm` is 0 and `ConflictIndex` is the follower's last index + 1. This carries the follower's log length, so no separate field is needed.
   - Otherwise: `ConflictTerm` is the term of the follower's entry at `PrevLogIndex`, and `ConflictIndex` is the first index of that term in the follower's log. Terms never decrease along a log, so the term's entries form one run.
 
-On a rejection, the leader computes where to resume:
+The leader acts only on a rejection of its latest probe, one whose `PrevLogIndex` is `nextIndex − 1`. Any other rejection answers a probe the leader has already moved past, because replies arrive late or twice, so the leader ignores it. Then it computes where to resume:
 
 1. If `ConflictTerm` is not 0 and the leader's log holds entries of that term, resume just past the leader's last entry of that term.
 2. Otherwise, resume at `ConflictIndex`.
 
-It then sets `nextIndex = max(matchIndex + 1, min(nextIndex − 1, that index))` and retries at once. Taking the minimum with `nextIndex − 1` means every rejection backs up by at least one entry, so even a stale or duplicated reply cannot stall the search or move it forward. The bound `matchIndex + 1` keeps it from resending entries the follower is known to hold.
+It then sets `nextIndex = max(matchIndex + 1, min(nextIndex − 1, that index))` and retries at once. Taking the minimum with `nextIndex − 1` means every rejection it acts on backs up by at least one entry, so even an odd reply cannot stall the search or move it forward. The bound `matchIndex + 1` keeps it from resending entries the follower is known to hold.
 
 A rejection at step 1 (a stale term) carries no conflict information. Its `Term` is higher than the leader's, so the leader steps down before it looks at anything else.
 
@@ -39,4 +41,5 @@ A rejection at step 1 (a stale term) carries no conflict information. Its `Term`
 
 - A diverging follower converges in one round trip per conflicting term. `TestFigure7FollowersConverge` pins the count for each of Figure 7's follower logs, and `TestDivergentLogConvergesPerTerm` shows a 100-entry divergence resolved in one rejection where one-at-a-time takes fifty.
 - The rules affect only how fast logs converge, never safety: the consistency check at step 2 still guards every append, so a wrong guess costs a round trip, not a wrong log.
-- The three fields become part of the message format the transport encodes.
+- Before rejections named their probe, a rejection that arrived twice, or answered a heartbeat and a proposal sent together, backed `nextIndex` up one entry more for each copy. That could reach into the leader's snapshot and start a snapshot transfer the follower did not need, as simulator seed 31 showed. `TestLeaderIgnoresStaleRejection` covers it.
+- The four fields become part of the message format the transport encodes.
