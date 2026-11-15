@@ -57,6 +57,18 @@ func DefaultConfig() (Config, time.Duration) {
 	return Config{ElectionTick: 30, HeartbeatTick: 5, SnapshotChunkSize: 1 << 20, MaxAppendSize: 1 << 20}, 10 * time.Millisecond
 }
 
+// MITLabConfig returns the settings MIT 6.5840's Lab 3 tests require: a
+// tick every 10 ms; a heartbeat every 10 ticks (100 ms), the lab's limit
+// of ten a second; election timeouts drawn from [400 ms, 800 ms), well
+// inside the five seconds the lab allows for electing a new leader; and
+// each snapshot sent whole in one InstallSnapshot, as the lab requires.
+// Entries per AppendEntries are not capped, because the lab's RPC
+// library has no size limit, so this preset does not suit the HTTP
+// transport.
+func MITLabConfig() (Config, time.Duration) {
+	return Config{ElectionTick: 40, HeartbeatTick: 10}, 10 * time.Millisecond
+}
+
 // validate reports the first way c would break the algorithm. A server that
 // misjudges the membership can count a majority that is not one, and a
 // heartbeat interval at or above the election timeout lets followers time

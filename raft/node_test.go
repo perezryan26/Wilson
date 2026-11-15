@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"testing"
+	"time"
 )
 
 // testConfig returns the default timing for server id of a cluster of
@@ -153,6 +154,26 @@ func TestNewNodeRejectsInvalidConfig(t *testing.T) {
 			}()
 			NewNode(cfg, RestoredState{})
 		})
+	}
+}
+
+// MITLabConfig keeps to MIT 6.5840 Lab 3's limits: at most ten heartbeats
+// a second, elections that leave room for a split vote or two within the
+// five seconds the lab allows, and whole snapshots.
+func TestMITLabConfigKeepsLabLimits(t *testing.T) {
+	cfg, tick := MITLabConfig()
+	if hb := time.Duration(cfg.HeartbeatTick) * tick; hb < 100*time.Millisecond {
+		t.Errorf("a heartbeat every %v, want at most ten a second", hb)
+	}
+	if longest := time.Duration(2*cfg.ElectionTick) * tick; longest > time.Second {
+		t.Errorf("election timeouts up to %v, want at most 1s", longest)
+	}
+	if cfg.SnapshotChunkSize != 0 {
+		t.Errorf("SnapshotChunkSize = %d, want 0: the lab sends each snapshot whole", cfg.SnapshotChunkSize)
+	}
+	cfg.ID, cfg.Peers, cfg.Rand = 1, []NodeID{1, 2, 3}, rand.New(rand.NewPCG(1, 1))
+	if err := cfg.validate(); err != nil {
+		t.Error(err)
 	}
 }
 
