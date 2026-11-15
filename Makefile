@@ -6,7 +6,11 @@ GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v
 SEEDS ?= 1000
 FUZZTIME ?= 60s
 
-.PHONY: check fmt vet lint test sim fuzz
+# PART picks the MIT 6.5840 Lab 3 part (3 for all); RUNS repeats it.
+PART ?= 3
+RUNS ?= 1
+
+.PHONY: check fmt vet lint test sim fuzz mitlab
 
 # check is everything CI runs on every push.
 check: fmt vet lint test sim fuzz
@@ -29,3 +33,7 @@ sim:
 
 fuzz:
 	FUZZTIME=$(FUZZTIME) ./scripts/fuzz.sh
+
+# mitlab needs MITLAB_ADAPTER, the private adapter's checkout (docs/TESTING.md).
+mitlab:
+	./scripts/mitlab.sh -n $(RUNS) $(PART)
