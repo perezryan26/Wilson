@@ -2,6 +2,7 @@ package raft
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -339,6 +340,39 @@ func TestLeaderSendsRestToLaggingFollower(t *testing.T) {
 	req := oneAppend(t, n.Ready(), 2)
 	if req.PrevLogIndex != 2 || len(req.Entries) != 1 || req.Entries[0].Index != 3 {
 		t.Errorf("sent %d entries after entry %d, want entry 3 after entry 2", len(req.Entries), req.PrevLogIndex)
+	}
+}
+
+// MaxAppendSize caps each AppendEntries: it carries as many entries as
+// fit, each counting as its command plus a fixed allowance, but always at
+// least one, even an entry over the cap. Each success sends the next
+// batch at once, so a lagging follower catches up batch by batch.
+func TestAppendEntriesCarryAtMostMaxAppendSize(t *testing.T) {
+	cfg := testConfig(1, 3, 1)
+	cfg.MaxAppendSize = 2 * entrySize([]byte("x"))
+	commands := []string{"a", "b", "c", strings.Repeat("d", cfg.MaxAppendSize), "e"}
+	restored := RestoredState{HardState: HardState{CurrentTerm: 1}}
+	for i, cmd := range commands {
+		restored.Entries = append(restored.Entries, Entry{Index: Index(i + 1), Term: 1, Data: []byte(cmd)})
+	}
+	n := NewNode(cfg, restored)
+	tickUntilElection(t, n)
+	n.Step(voteResponse(2, 2, true))
+	n.Ready()
+	n.Step(Message{From: 2, To: 1, AppendEntriesResponse: &AppendEntriesResponse{Term: 2, PrevLogIndex: 5, ConflictIndex: 1}})
+	for _, want := range [][]Index{{1, 2}, {3}, {4}, {5}} {
+		req := oneAppend(t, n.Ready(), 2)
+		var got []Index
+		for _, e := range req.Entries {
+			got = append(got, e.Index)
+		}
+		if req.PrevLogIndex != want[0]-1 || !slices.Equal(got, want) {
+			t.Fatalf("sent entries %v after entry %d, want %v", got, req.PrevLogIndex, want)
+		}
+		n.Step(appendResponse(2, 2, true, got[len(got)-1]))
+	}
+	if sent := sentTo(n.Ready(), 2); len(sent) != 0 {
+		t.Errorf("sent %+v after the follower held every entry", sent)
 	}
 }
 

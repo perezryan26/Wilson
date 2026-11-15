@@ -15,11 +15,13 @@ func (n *Node) broadcastAppend() {
 	}
 }
 
-// sendAppend sends server to an AppendEntries carrying every entry from its
-// nextIndex on (Figure 2, leaders), or none when it already has them all,
-// which makes it a heartbeat (§5.2). Every heartbeat therefore also retries
-// whatever a lost message failed to deliver. If the snapshot has replaced
-// the entry at nextIndex, it sends the snapshot instead (§7).
+// sendAppend sends server to an AppendEntries carrying the entries from its
+// nextIndex on (Figure 2, leaders), as many as maxAppendSize allows, or
+// none when it already has them all, which makes it a heartbeat (§5.2).
+// Every heartbeat therefore also retries whatever a lost message failed to
+// deliver, and each success sends the next batch (see acknowledge). If
+// the snapshot has replaced the entry at nextIndex, it sends the snapshot
+// instead (§7).
 func (n *Node) sendAppend(to NodeID) {
 	next := n.nextIndex[to]
 	if next <= n.log.snapshotIndex() {
@@ -32,7 +34,7 @@ func (n *Node) sendAppend(to NodeID) {
 		LeaderID:     n.id,
 		PrevLogIndex: next - 1,
 		PrevLogTerm:  prevTerm,
-		Entries:      n.log.from(next),
+		Entries:      n.log.batch(next, n.maxAppendSize),
 		LeaderCommit: n.commitIndex,
 	}})
 }

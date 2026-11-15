@@ -46,6 +46,30 @@ func (l *raftLog) lastTerm() Term { return l.entries[len(l.entries)-1].Term }
 // append adds e, which follows the last entry, to the log.
 func (l *raftLog) append(e Entry) { l.entries = append(l.entries, e) }
 
+// entryOverhead is what an entry counts for toward Config.MaxAppendSize
+// beyond its command: an allowance for its index and term, as large as
+// their encoding in a message.
+const entryOverhead = 64
+
+// entrySize returns what an entry with command data counts for toward
+// Config.MaxAppendSize.
+func entrySize(data []byte) int { return len(data) + entryOverhead }
+
+// batch returns a copy of the entries from index i on, as many as fit in
+// maxSize bytes by entrySize but at least one if there are any, or all of
+// them if maxSize is 0.
+func (l *raftLog) batch(i Index, maxSize int) []Entry {
+	entries := l.entries[i-l.snapshotIndex():]
+	size := 0
+	for j, e := range entries {
+		size += entrySize(e.Data)
+		if maxSize > 0 && size > maxSize && j > 0 {
+			return slices.Clone(entries[:j])
+		}
+	}
+	return slices.Clone(entries)
+}
+
 // from returns a copy of the entries from index i to the end. A copy, so
 // that a later truncation of the log cannot rewrite entries already handed
 // out in a message or a Ready.

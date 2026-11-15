@@ -14,6 +14,11 @@ import (
 // this server knows it.
 var ErrNotLeader = errors.New("raft: not the leader")
 
+// ErrProposalTooLarge is the error Propose returns for a command whose
+// entry alone would exceed Config.MaxAppendSize. No AppendEntries within
+// the cap could carry it, so no follower could ever store it.
+var ErrProposalTooLarge = errors.New("raft: proposal too large")
+
 // Config holds what NewNode needs to know about the server and its cluster.
 type Config struct {
 	// ID identifies this server. It must be one of Peers.
@@ -34,15 +39,22 @@ type Config struct {
 	// carries (Figure 13's chunks). Zero sends the whole snapshot in one
 	// message.
 	SnapshotChunkSize int
+	// MaxAppendSize caps the entries one AppendEntries carries, so that a
+	// transport that limits the size of a message can carry every one. An
+	// entry counts as the length of its command plus a fixed allowance
+	// for its index and term. A message holds as many entries as fit,
+	// but always at least one, so Propose refuses a command whose entry
+	// alone would exceed the cap. Zero means no cap.
+	MaxAppendSize int
 }
 
 // DefaultConfig returns the settings for a cluster on one local network:
 // a tick every 10 ms, a heartbeat every 5 ticks (50 ms), election
-// timeouts drawn from [300 ms, 600 ms), and snapshots sent in chunks of
-// 1 MiB. The runtime calls Tick once per returned interval, and the
-// caller fills in ID, Peers, and Rand.
+// timeouts drawn from [300 ms, 600 ms), and snapshots and entries sent
+// in messages of at most 1 MiB. The runtime calls Tick once per returned
+// interval, and the caller fills in ID, Peers, and Rand.
 func DefaultConfig() (Config, time.Duration) {
-	return Config{ElectionTick: 30, HeartbeatTick: 5, SnapshotChunkSize: 1 << 20}, 10 * time.Millisecond
+	return Config{ElectionTick: 30, HeartbeatTick: 5, SnapshotChunkSize: 1 << 20, MaxAppendSize: 1 << 20}, 10 * time.Millisecond
 }
 
 // validate reports the first way c would break the algorithm. A server that
@@ -65,6 +77,8 @@ func (c Config) validate() error {
 		return errors.New("nil Rand")
 	case c.SnapshotChunkSize < 0:
 		return fmt.Errorf("negative SnapshotChunkSize %d", c.SnapshotChunkSize)
+	case c.MaxAppendSize < 0:
+		return fmt.Errorf("negative MaxAppendSize %d", c.MaxAppendSize)
 	}
 	return nil
 }
@@ -124,6 +138,7 @@ type Node struct {
 	heartbeatTick     int
 	rand              *rand.Rand
 	snapshotChunkSize int
+	maxAppendSize     int
 
 	// Persistent state on all servers (Figure 2), and the snapshot that
 	// replaced the log's earlier entries (§7), which a leader sends to
@@ -181,6 +196,7 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 		heartbeatTick:     cfg.HeartbeatTick,
 		rand:              cfg.Rand,
 		snapshotChunkSize: cfg.SnapshotChunkSize,
+		maxAppendSize:     cfg.MaxAppendSize,
 		currentTerm:       hs.CurrentTerm,
 		votedFor:          hs.VotedFor,
 		log:               newLog(restored.Snapshot, restored.Entries),
@@ -246,8 +262,12 @@ func (n *Node) Step(m Message) {
 // Propose appends cmd to the leader's log as a new entry of the current
 // term and returns the entry's index and term (Figure 2, leaders). The
 // entry counts as committed only once a majority stores it; until then a
-// later leader may overwrite it.
+// later leader may overwrite it. A command too large for MaxAppendSize is
+// refused on every server.
 func (n *Node) Propose(cmd []byte) (Index, Term, error) {
+	if n.maxAppendSize > 0 && entrySize(cmd) > n.maxAppendSize {
+		return 0, 0, ErrProposalTooLarge
+	}
 	if n.role != Leader {
 		return 0, 0, ErrNotLeader
 	}

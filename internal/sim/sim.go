@@ -42,6 +42,9 @@ type Options struct {
 	// the most snapshot bytes one InstallSnapshot carries, or the whole
 	// snapshot if it is 0.
 	SnapshotChunkSize int
+	// MaxAppendSize is each server's raft.Config.MaxAppendSize: the most
+	// entry bytes one AppendEntries carries, or no limit if it is 0.
+	MaxAppendSize int
 }
 
 // Cluster is a simulated raft cluster. It runs every server in one
@@ -57,6 +60,7 @@ type Cluster struct {
 	commands int // commands proposed so far, for naming the next
 
 	snapshotChunkSize int // see Options
+	maxAppendSize     int
 
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
@@ -109,6 +113,7 @@ func New(opts Options) *Cluster {
 		entries: map[logKey]entryInfo{},
 
 		snapshotChunkSize: opts.SnapshotChunkSize,
+		maxAppendSize:     opts.MaxAppendSize,
 		traceMessages:     opts.TraceMessages,
 	}
 	_, tick := raft.DefaultConfig()
@@ -316,6 +321,7 @@ func (c *Cluster) boot(n *node) {
 	cfg.Peers = c.ids()
 	cfg.Rand = rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))
 	cfg.SnapshotChunkSize = c.snapshotChunkSize
+	cfg.MaxAppendSize = c.maxAppendSize
 	n.core = raft.NewNode(cfg, restored)
 	n.boots++
 	n.status = n.core.Status()

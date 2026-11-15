@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"math/rand/v2"
 	"slices"
@@ -139,6 +140,7 @@ func TestNewNodeRejectsInvalidConfig(t *testing.T) {
 		{"heartbeat as long as the election timeout", func(c *Config) { c.HeartbeatTick = c.ElectionTick }},
 		{"nil Rand", func(c *Config) { c.Rand = nil }},
 		{"negative snapshot chunk size", func(c *Config) { c.SnapshotChunkSize = -1 }},
+		{"negative MaxAppendSize", func(c *Config) { c.MaxAppendSize = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -195,6 +197,26 @@ func TestProposeAppendsOnLeader(t *testing.T) {
 		}
 		want := []Entry{{Index: Index(i + 1), Term: 1, Data: []byte(cmd)}}
 		wantEntries(t, "Ready entries", n.Ready().Entries, want)
+	}
+}
+
+// Every server refuses a command whose entry alone would exceed
+// MaxAppendSize, because no AppendEntries within the cap could carry it.
+func TestProposeRefusesCommandOverMaxAppendSize(t *testing.T) {
+	fits := bytes.Repeat([]byte("x"), 100-entryOverhead)
+	n := newLeader(t, 3)
+	n.maxAppendSize = 100
+	if _, _, err := n.Propose(fits); err != nil {
+		t.Fatalf("Propose of a command that fits: %v", err)
+	}
+	if _, _, err := n.Propose(append(fits, 'x')); !errors.Is(err, ErrProposalTooLarge) {
+		t.Errorf("Propose of a command one byte over: error = %v, want ErrProposalTooLarge", err)
+	}
+	wantEntries(t, "Ready entries", n.Ready().Entries, []Entry{{Index: 1, Term: 1, Data: fits}})
+	f := newTestNode(1, 3, 1)
+	f.maxAppendSize = 100
+	if _, _, err := f.Propose(append(fits, 'x')); !errors.Is(err, ErrProposalTooLarge) {
+		t.Errorf("a follower's Propose of a command one byte over: error = %v, want ErrProposalTooLarge", err)
 	}
 }
 
