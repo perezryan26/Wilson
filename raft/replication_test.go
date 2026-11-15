@@ -194,8 +194,9 @@ func TestFollowerAdvancesCommitIndex(t *testing.T) {
 }
 
 // Figure 2, leaders: a new leader sets every follower's nextIndex just past
-// its own last entry, and sends each new entry at once to every follower,
-// with the entry before it for the consistency check.
+// its own last entry, and sends a new entry at once to every follower
+// whose next entry it is, here all of them, with the entry before it for
+// the consistency check.
 func TestLeaderSendsEntriesFromNextIndex(t *testing.T) {
 	n := newLeaderWithLog(t, 3, 1, 2)
 	if _, _, err := n.Propose([]byte("x")); err != nil {
@@ -211,6 +212,28 @@ func TestLeaderSendsEntriesFromNextIndex(t *testing.T) {
 			t.Fatalf("message %d = %+v, want AppendEntries after entry 2 of term 2", i, m)
 		}
 		wantEntries(t, "entries sent", req.Entries, []Entry{{Index: 3, Term: 3, Data: []byte("x")}})
+	}
+}
+
+// A follower still owed an earlier entry gets a new one only along with
+// it, from the AppendEntries the earlier entry's acknowledgment sends, so
+// a burst of proposals does not resend entries already on their way.
+func TestProposalWaitsForEarlierEntries(t *testing.T) {
+	n := newLeaderWithLog(t, 3, 1, 2)
+	if _, _, err := n.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	n.Ready()
+	if _, _, err := n.Propose([]byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := n.Ready().Messages; len(msgs) != 0 {
+		t.Fatalf("the second proposal sent %d messages, want none before entry 3 is acknowledged", len(msgs))
+	}
+	n.Step(appendResponse(2, 3, true, 3))
+	req := oneAppend(t, n.Ready(), 2)
+	if req.PrevLogIndex != 3 || len(req.Entries) != 1 || req.Entries[0].Index != 4 {
+		t.Errorf("sent %d entries after entry %d, want entry 4 after entry 3", len(req.Entries), req.PrevLogIndex)
 	}
 }
 

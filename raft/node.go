@@ -285,7 +285,16 @@ func (n *Node) Propose(cmd []byte) (Index, Term, error) {
 	}
 	e := Entry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Data: cmd}
 	n.log.append(e)
-	n.broadcastAppend()
+	for _, id := range n.peers {
+		// Only a follower whose next entry this is gets it at once. Any
+		// other is still owed earlier entries, which the reply to the
+		// AppendEntries carrying them (see acknowledge), or the next
+		// heartbeat, will deliver along with this one; sending now would
+		// only repeat them.
+		if id != n.id && n.nextIndex[id] == e.Index {
+			n.sendAppend(id)
+		}
+	}
 	n.maybeCommit()
 	return e.Index, e.Term, nil
 }

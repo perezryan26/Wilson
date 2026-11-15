@@ -308,3 +308,46 @@ func TestLaggingServerCatchesUpThroughSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// A burst of proposals that outruns the network costs each follower a few
+// AppendEntries, not one or more per proposal. The leader sends a new
+// entry at once only to a follower whose next entry it is; any other
+// follower gets it with the reply-driven AppendEntries already due, or
+// the next heartbeat. MIT 6.5840's TestCount3B found a leader that sent
+// each follower its unacknowledged entries again on every proposal and on
+// every reply that left the follower behind: 46 RPCs to commit 12
+// commands where the test allows 42.
+func TestProposalBurstSendsFewAppendEntries(t *testing.T) {
+	const burst = 12
+	for seed := range uint64(10) {
+		c := sim.New(sim.Options{Size: 3, Seed: seed, TraceMessages: true})
+		lead, _ := awaitLeader(t, c)
+		before := c.Trace()
+		var last raft.Index
+		for i := range burst {
+			index, _, err := c.Propose(lead, []byte(fmt.Sprintf("c%d", i)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			last = index
+		}
+		err := c.RunUntil(time.Second, "every server to apply the burst", func() bool {
+			for id := raft.NodeID(1); id <= 3; id++ {
+				if st, _ := c.Status(id); st.LastApplied < last {
+					return false
+				}
+			}
+			return true
+		})
+		if err != nil {
+			t.Fatalf("seed %d: %v\n%s", seed, err, c.Trace())
+		}
+		for id := raft.NodeID(1); id <= 3; id++ {
+			appends := fmt.Sprintf("→n%d AppendEntries ", id)
+			if n := strings.Count(c.Trace(), appends) - strings.Count(before, appends); id != lead && n > burst/2 {
+				t.Errorf("seed %d: server %d got %d AppendEntries for a burst of %d proposals, want at most %d",
+					seed, id, n, burst, burst/2)
+			}
+		}
+	}
+}
