@@ -22,21 +22,30 @@ const (
 // restarts, and networks that lose, duplicate, and delay messages. All the
 // while, a client proposes commands to whichever servers believe they
 // lead, in half the seeds pausing after each new leader, and the servers
-// compact their logs as often as every entry, or never, and send
-// snapshots whole or in small chunks, as the seed chooses. Then every
-// fault heals, and within ten seconds the servers must agree on a leader,
-// and within ten more apply a command proposed to it. RunRandomized
-// returns the cluster, whose trace tells what happened, and the first
-// violation or liveness failure. traceMessages adds every message to the
-// trace.
+// compact their logs as often as every entry, or never, all alike or in
+// half the seeds each on its own schedule, and send snapshots whole or in
+// small chunks, as the seed chooses. Then every fault heals, and within
+// ten seconds the servers must agree on a leader, and within ten more
+// apply a command proposed to it. RunRandomized returns the cluster,
+// whose trace tells what happened, and the first violation or liveness
+// failure. traceMessages adds every message to the trace.
 func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
+	thresholds := []int{0, 1, 2, 4, 8}
 	c := New(Options{
 		Size:              1 + int(seed%5),
 		Seed:              seed,
 		TraceMessages:     traceMessages,
-		CompactEvery:      []int{0, 1, 2, 4, 8}[seed/5%5],
+		CompactEvery:      thresholds[seed/5%5],
 		SnapshotChunkSize: []int{0, 16, 128}[seed/25%3],
 	})
+	if seed/150%2 == 1 {
+		// Servers that compact on schedules of their own leave a follower
+		// with a snapshot past entries its leader still sends it.
+		for _, n := range c.nodes {
+			n.compactEvery = thresholds[c.rng.IntN(len(thresholds))]
+			c.tracef("%s compactEvery=%d", name(n.id), n.compactEvery)
+		}
+	}
 	c.runClient(seed/75%2 == 1, 0)
 	for c.now < faultTime {
 		if err := c.RunFor(c.randDuration(50*time.Millisecond, time.Second)); err != nil {

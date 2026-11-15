@@ -56,8 +56,7 @@ type Cluster struct {
 
 	commands int // commands proposed so far, for naming the next
 
-	compactEvery      int // see Options
-	snapshotChunkSize int
+	snapshotChunkSize int // see Options
 
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
@@ -82,8 +81,11 @@ type node struct {
 	storage *storage.FileStorage // the WAL on disk; nil while the server is down
 	disk    *storage.FaultFS
 	period  time.Duration // this server's tick interval
-	boots   int           // how many times the server has started
-	status  raft.Status   // as of the last event, for the trace
+	// compactEvery is the server's Options.CompactEvery. The randomized
+	// schedule may give each server its own.
+	compactEvery int
+	boots        int         // how many times the server has started
+	status       raft.Status // as of the last event, for the trace
 
 	maxTerm raft.Term                 // highest currentTerm seen, across restarts
 	votes   map[raft.Term]raft.NodeID // every vote the server saved, by term
@@ -106,7 +108,6 @@ func New(opts Options) *Cluster {
 		leaders: map[raft.Term]raft.NodeID{},
 		entries: map[logKey]entryInfo{},
 
-		compactEvery:      opts.CompactEvery,
 		snapshotChunkSize: opts.SnapshotChunkSize,
 		traceMessages:     opts.TraceMessages,
 	}
@@ -115,10 +116,11 @@ func New(opts Options) *Cluster {
 		// Servers' clocks drift apart: each ticks up to 20% fast or slow.
 		perMille := time.Duration(c.rng.IntN(401) - 200)
 		c.nodes = append(c.nodes, &node{
-			id:     raft.NodeID(i + 1),
-			disk:   storage.NewFaultFS(rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))),
-			period: tick * (1000 + perMille) / 1000,
-			votes:  map[raft.Term]raft.NodeID{},
+			id:           raft.NodeID(i + 1),
+			disk:         storage.NewFaultFS(rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))),
+			period:       tick * (1000 + perMille) / 1000,
+			compactEvery: opts.CompactEvery,
+			votes:        map[raft.Term]raft.NodeID{},
 		})
 	}
 	for _, n := range c.nodes {
@@ -386,7 +388,7 @@ func (c *Cluster) handleReady(n *node) {
 // maybeCompact has n's service snapshot its state machine, once it has
 // applied compactEvery entries past its latest snapshot (§7).
 func (c *Cluster) maybeCompact(n *node) {
-	if c.compactEvery == 0 || n.core == nil || n.applied < n.snapshot+raft.Index(c.compactEvery) {
+	if n.compactEvery == 0 || n.core == nil || n.applied < n.snapshot+raft.Index(n.compactEvery) {
 		return
 	}
 	if err := n.core.Compact(n.applied, c.stateAt(n.applied)); err != nil {
