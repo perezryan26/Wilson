@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-27
+- Amended: 2026-11-14, the message path and size limits
 
 ## Context
 
@@ -18,8 +19,9 @@ The options:
 
 Node-to-node messages and the client API both use HTTP/1.1 and JSON from `net/http` and `encoding/json`.
 
-- **Raft traffic is one-way.** A node sends each `raft.Message` as its own POST to the peer's message endpoint, and the peer answers `204 No Content` once the message is queued for its core. A Raft-level response, such as a granted vote, travels back later as its own POST. This mirrors the core (ADR-0001), where a response is just another message, released through `Ready` only after the state it reflects is durable. The transport never holds an HTTP request open across a disk write, and it never matches replies to requests.
+- **Raft traffic is one-way.** A node sends each `raft.Message` as its own POST to the peer's `/raft/v1/message`, and the peer answers `204 No Content` once the message is queued for its core. A Raft-level response, such as a granted vote, travels back later as its own POST. This mirrors the core (ADR-0001), where a response is just another message, released through `Ready` only after the state it reflects is durable. The transport never holds an HTTP request open across a disk write, and it never matches replies to requests.
 - **Loss over blocking.** Each peer has one sender goroutine fed by a bounded queue. A message that arrives when the queue is full is dropped, and every request has a timeout. Raft already tolerates lost messages and recovers through heartbeats and elections, so a slow or dead peer costs dropped messages, never a stalled node.
+- **Bounded messages.** A server refuses a message body over 4 MiB. The core caps what one message carries: 1 MiB of entries in an AppendEntries (`MaxAppendSize`, counting each entry as its command plus 64 bytes) and 1 MiB of a snapshot in an InstallSnapshot (`SnapshotChunkSize`). It refuses a command too large for the first cap, since an AppendEntries carries at least one entry. Every message therefore fits, base64 included, and a test drives a core to its largest messages to keep it that way. Without the caps, the message that catches up a follower far behind would grow with the gap until every follower refused it.
 - **Client API.** `GET`, `PUT`, and `DELETE` on `/v1/kv/{key}`, routed with the method and wildcard patterns of `net/http`'s `ServeMux`, with JSON bodies. A follower answers with a hint naming the leader.
 - **Behind an interface.** The runtime sends through a `Transport` interface in `internal/transport` whose methods use only `raft` and standard-library types. gRPC, or anything else, can replace HTTP later without touching the core or the runtime.
 
@@ -28,5 +30,5 @@ Node-to-node messages and the client API both use HTTP/1.1 and JSON from `net/ht
 - There is no code generation and no dependency, and a node can be inspected or prodded with `curl`.
 - JSON is larger and slower to encode than a binary format, and `[]byte` fields (commands and snapshot chunks) travel as base64, about a third larger. Clarity beats performance here, and the snapshot chunk size is configurable.
 - One-way messages take twice as many HTTP requests as call-and-reply RPC, and each message is its own request with no batching. Keep-alive connections make that cheap on a local network; batching is a later performance question.
-- The message decoder reads input from the network, so it gets a fuzz target, and request bodies are size-limited.
+- The message decoder reads input from the network, so it gets a fuzz target (`FuzzMessageDecode`), and request bodies are size-limited.
 - There is no TLS or authentication (a non-goal), so anyone who can reach the port can send Raft messages. The README lists this under Limitations.

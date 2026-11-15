@@ -63,9 +63,37 @@ for each input, a tick or an inbound message {
 }
 ```
 
-Two drivers exist today, both for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). Its servers compact their logs, and its state machine is the list of commands applied. The runtime in `node/` is not written yet.
+Three drivers exist today. The runtime in [`node/`](../node) runs the loop in a real process ([below](#the-runtime)), and two drive it for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). Its servers compact their logs, and its state machine is the list of commands applied.
 
 `NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote, that snapshot, and the log after it. The runtime restores the state machine from the snapshot first. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at the snapshot's last included index, or at 0 with no snapshot, relearns what is committed from the leader, and applies its log again from there.
+
+## The runtime
+
+[`node`](../node) runs a core in a real process. One goroutine owns the core and selects over four inputs: a ticker that fires once per tick interval of the preset, 10 ms for `DefaultConfig`; inbound messages; proposals; and `Stop`. After each input it handles the `Ready` completely, in the contract's order:
+
+1. **Save.** `Storage.Save`, which returns once the hard state, snapshot, and entries are fsynced. A failed save ends the goroutine for good, with nothing sent or applied, because after a failed write or fsync what the disk holds is unknown. `Done`, `Err`, and `Stop` report the error, and `kvnode` exits with status 1.
+2. **Send.** `Transport.Send` for each message, which never blocks.
+3. **Restore and apply.** `StateMachine.Restore` if the snapshot is past what the state machine applied, which happens only for a snapshot the leader sent. Then `StateMachine.Apply` for each committed entry, in index order.
+
+Once `CompactEvery` entries have been applied past the latest snapshot, the node takes a snapshot of the state machine, calls `Compact`, and handles the `Ready` that follows.
+
+- `Step` hands an inbound message to the goroutine through a queue of 1,024 and returns at once. A message that finds the queue full is dropped, as the network might have dropped it.
+- `Propose` hands a command to the goroutine and returns the new entry's index and term once the entry is saved, so a caller never learns of an entry this server could lose in a crash. The entry is not committed yet. A proposal to a follower returns `raft.ErrNotLeader`, and one too large to replicate returns `raft.ErrProposalTooLarge`.
+- `Status` returns the core's status as of the last input. The node logs every change of role, term, or leader, and every snapshot it installs from the leader.
+- `Start` restores the state machine from the latest snapshot before it creates the core, which starts with `lastApplied` at that snapshot's last included index.
+
+## Transport
+
+The runtime sends through the `Transport` interface in [`internal/transport`](../internal/transport). Its one method, `Send(raft.Message)`, must not block. Like `Storage`, it uses only `raft` and standard-library types, so a package outside this module can implement it without importing `internal/`. `HTTP` implements it ([ADR-0002](adr/0002-http-json-transport.md)):
+
+- **One POST per message.** A message travels as the JSON of a `raft.Message`, with Go's field names, in a POST to the receiver's `/raft/v1/message`. The receiver answers 204 No Content once it has handed the message to its node. A Raft response travels back later, as a message of its own.
+- **One sender per peer.** Each peer has a goroutine that sends its messages in order from a queue of 256. `Send` drops a message whose queue is full, and each request times out after a second, so a slow or dead peer costs dropped messages, never a stalled node. A peer that becomes unreachable is logged once, and again once it is reached.
+- **Checks on arrival.** The handler refuses a body over 4 MiB with 413. It refuses with 400 a message that does not carry exactly one RPC, is not addressed to this server, or comes from a server that is not its peer. The last two mean that two servers disagree about the cluster's members or addresses.
+- **Size.** Every message the core sends fits in those 4 MiB. The core sends at most `SnapshotChunkSize` bytes of a snapshot in one InstallSnapshot, and at most `MaxAppendSize` bytes of entries in one AppendEntries, counting each entry as its command plus 64 bytes for its index and term. `DefaultConfig` sets both to 1 MiB. An AppendEntries always carries at least one entry, so `Propose` refuses a command whose entry alone would exceed the cap. Base64 makes the bytes a third larger in JSON, so the largest messages take about 1.4 MB, as `TestEveryMessageFitsMaxMessageSize` checks.
+
+## The server
+
+[`cmd/kvnode`](../cmd/kvnode) runs one server. It creates the data directory if it is missing and fsyncs the directory's parent, opens `FileStorage` there, starts the HTTP transport and the node, and serves the transport's handler on its address. Every log line carries the node's ID, term, and role. SIGINT or SIGTERM stops it in order: the HTTP server stops taking requests and lets those under way finish, then the node stops, then the transport and storage close. Until the key-value service exists, its state machine is the list of commands applied, which `POST /debug/propose` and `GET /debug/state` drive and show.
 
 ## Storage
 
@@ -158,10 +186,10 @@ Steps 1 and 2 each write a temporary file ending in `.tmp`, fsync it, rename it 
 
 The log (`raftLog`) holds a sentinel entry at index 0 of term 0 ahead of the real entries, so the entry before the first always exists. It is the only code that turns a log index into a slice position.
 
-- **Proposals.** `Propose` on the leader appends an entry of the current term and sends AppendEntries to every follower at once; on any other server it returns `ErrNotLeader`.
-- **Sending.** For each follower the leader keeps `nextIndex` and `matchIndex`, reset after every election. Every AppendEntries carries all the entries from the follower's `nextIndex` on, so a heartbeat also retries whatever a lost message failed to deliver.
+- **Proposals.** `Propose` on the leader appends an entry of the current term and sends AppendEntries to every follower at once; on any other server it returns `ErrNotLeader`. Every server refuses, with `ErrProposalTooLarge`, a command whose entry alone would exceed `MaxAppendSize`.
+- **Sending.** For each follower the leader keeps `nextIndex` and `matchIndex`, reset after every election. Every AppendEntries carries the entries from the follower's `nextIndex` on, as many as `MaxAppendSize` allows but at least one, so a heartbeat also retries whatever a lost message failed to deliver. Each success sends the next batch at once.
 - **Receiving.** The follower checks the entry at `PrevLogIndex`, keeps the entries it already holds, truncates only at a real conflict, appends the rest, and raises `commitIndex` to `min(LeaderCommit, the request's last entry)`. A stale or repeated request truncates nothing.
-- **Replies.** A success names what it acknowledges, `MatchIndex = PrevLogIndex + len(Entries)`, because replies arrive late, twice, or out of order. `matchIndex` only moves forward. A rejection names where the logs part, and the leader skips a whole conflicting term per round trip ([ADR-0004](adr/0004-fast-log-backtracking.md)).
+- **Replies.** A success names what it acknowledges, `MatchIndex = PrevLogIndex + len(Entries)`, because replies arrive late, twice, or out of order. `matchIndex` only moves forward. A rejection names the `PrevLogIndex` it answers and where the logs part. The leader acts only on a rejection of its latest probe, because a stale one could back `nextIndex` up past entries the follower holds, and it skips a whole conflicting term per round trip ([ADR-0004](adr/0004-fast-log-backtracking.md)).
 - **Commitment.** The leader commits the highest index a majority stores, counting its own log, but only if that entry is from its current term (§5.4.2, Figure 8); earlier entries then commit with it.
 
 ## Log compaction
@@ -176,7 +204,7 @@ Each server snapshots its own state machine (§7), and a leader sends its snapsh
 
 ## Time
 
-The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)).
+The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)). The runtime ticks the core from a wall-clock ticker, which skips a tick the node is too busy to take rather than queue it. A message between two servers on one network takes about a millisecond, far below the heartbeat interval, as §5.6 requires.
 
 - **Election timer.** Each timeout is drawn uniformly from [`ElectionTick`, 2 × `ElectionTick`) ticks with the injected `*rand.Rand`, again at every reset (§5.2). A follower's timer restarts only when it hears an AppendEntries from the current leader or grants a vote; a candidate's restarts when it starts an election (Figure 2). A refused vote never restarts it, so a candidate that cannot win cannot hold off an election by asking.
 - **Heartbeats.** A leader sends an empty AppendEntries to every other server as soon as it is elected, then every `HeartbeatTick` ticks. `HeartbeatTick` must be below `ElectionTick`, so a follower hears from a healthy leader before it times out.
@@ -215,10 +243,20 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | --- | --- |
 | [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `Snapshot`, `HardState`, `Message` and the RPC structs, `Ready` |
 | [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions |
-| [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, the merge that carries out AppendEntries steps 3 and 4, and `restore`, which carries out Figure 13's steps 6 and 7 |
+| [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, batches capped by `MaxAppendSize`, the merge that carries out AppendEntries steps 3 and 4, and `restore`, which carries out Figure 13's steps 6 and 7 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
 | [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, following the current leader, the leader's handling of replies, fast backtracking, and the commit rule |
 | [`snapshot.go`](../raft/snapshot.go) | Sending a snapshot in chunks, the InstallSnapshot receiver's steps 1–8, and the leader's handling of replies |
+
+## Files in node/, internal/transport/, and cmd/kvnode/
+
+| File | Contents |
+| --- | --- |
+| [`node/node.go`](../node/node.go) | `Node`, `Start`, `Config`, `StateMachine`, `ErrStopped`: the goroutine, `Ready` handling, compaction, `Step`, `Propose`, `Status`, and `Stop` |
+| [`internal/transport/transport.go`](../internal/transport/transport.go) | `Transport`, the interface the runtime sends through |
+| [`internal/transport/http.go`](../internal/transport/http.go) | `HTTP`, `NewHTTP`, `HTTPOptions`, `MessagePath`, `MaxMessageSize`: the sender goroutines, the handler, and the message decoder |
+| [`cmd/kvnode/main.go`](../cmd/kvnode/main.go) | Flags, the data directory, startup, graceful shutdown, and the log handler that adds term and role |
+| [`cmd/kvnode/debug.go`](../cmd/kvnode/debug.go) | The state machine that lists commands, and the debug endpoints |
 
 ## Files in internal/storage/
 
