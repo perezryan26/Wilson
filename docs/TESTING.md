@@ -10,7 +10,7 @@ Six independent harnesses produce the evidence for Wilson's correctness, and no 
 | --- | --- | --- | --- |
 | Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Runs every test, among them the runtime's and the transport's, and three `kvnode` processes built with it |
 | Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks the five Figure 3 properties, terms, votes, applied order, and every snapshot after every event, with crashes in the middle of disk writes and compaction as often as every entry, and liveness after faults heal |
-| MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | 20 consecutive passing runs | Not built |
+| MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | By hand, through the private adapter; a lab counts as passed after 20 consecutive passing runs with `-race` | Lab 3 (3A–3D) passes 20 runs in a row, no test over 57 s and no run over 405 s; Lab 4 waits for the key-value service |
 | Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Not built |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target nightly and before each phase tag; crash tests on every test run | Fuzzes the WAL record, snapshot, and Raft message decoders; crash tests at every write boundary of the storage, snapshot saves included |
 | Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Nightly | Not built |
@@ -72,10 +72,10 @@ The first violation ends the run.
 
 Over 1,000 seeds:
 
-- 821 crashes are set to strike mid-write and 756 do, 256 of them leaving a torn record that recovery truncates. 844 more crashes strike between events.
-- Servers compact 34,175 times, restart from a snapshot 1,006 times, and install 2,432 snapshots from a leader.
+- 831 crashes are set to strike mid-write and 754 do, 254 of them leaving a torn record that recovery truncates. 815 more crashes strike between events.
+- Servers compact 34,279 times, restart from a snapshot 949 times, and install 2,656 snapshots from a leader.
 
-Some bugs need rare interleavings. A commit rule that counted replicas of earlier-term entries, the hazard of Figure 8, failed only 3 of 50,000 seeds while the client never paused, even with half of all crashes aimed at the leader. With the pause after each new leader it fails 23 of 50,000, nearly all of them seeds that pause. A core that treated the entries inside a follower's snapshot as mismatched passed every seed while all servers compacted alike, because a leader then rarely sends a follower entries that its own snapshot covers. With each server on its own schedule, it fails 6 of 2,000. A core whose InstallSnapshot did not restart the election timer still passes every seed, and only its unit test catches it. The nightly sweep is there for bugs like these, and Figure 8 also has its own scripted test.
+Some bugs need rare interleavings. A commit rule that counted replicas of earlier-term entries, the hazard of Figure 8, failed only 3 of 50,000 seeds while the client never paused, even with half of all crashes aimed at the leader. With the pause after each new leader it fails 30 of 50,000, 26 of them seeds that pause. A core that treated the entries inside a follower's snapshot as mismatched passed every seed while all servers compacted alike, because a leader then rarely sends a follower entries that its own snapshot covers. With each server on its own schedule, it fails 11 of 2,000, every one a seed that gives the servers schedules of their own; one of them never finishes, its leader and follower answering each other until the test times out. A core whose InstallSnapshot did not restart the election timer fails only 1 of 2,000, by a liveness timeout, so its unit test remains the check that counts. The nightly sweep is there for bugs like these, and Figure 8 also has its own scripted test.
 
 | Run | Seeds |
 | --- | --- |
@@ -88,31 +88,34 @@ A seed costs a few milliseconds of CPU, so 50,000 seeds take under a minute.
 
 ### Reading a trace
 
-Every run keeps a trace, and a failing seed prints it after the error. These lines are picked from seed 31's, replayed with `-seed=31`, which adds the messages:
+Every run keeps a trace, and a failing seed prints it after the error. These lines are picked from seed 306's, replayed with `-seed=306`, which adds the messages:
 
 ```text
-t=0.000ms n1 boot term=0 votedFor=none snapshot=0 lastIndex=0 tick=11.920ms
-t=470.672ms n2 candidate→leader term=1 leader=none→n2
-t=595.639ms n2 compact lastIncludedIndex=1
-t=595.639ms n2 leader term=1 leader=n2 commitIndex=0→1 lastApplied=0→1
-t=1729.891ms n2 will crash during disk operation 2 from now
-t=1822.665ms n2 crash during a disk write
-t=3584.306ms n2 boot term=1 votedFor=n2 snapshot=13 lastIndex=14 tick=10.690ms
-t=3937.444ms n2 candidate→leader term=5 leader=none→n2
-t=10423.191ms heal
-t=10423.191ms n2 msg="storage: truncated a record torn by a crash at the end of the WAL" segment=0000000000000043.wal offset=302 bytes=19
-t=10423.191ms n2 boot term=5 votedFor=n2 snapshot=33 lastIndex=42 tick=10.690ms
-t=10998.818ms n2 candidate→leader term=18 leader=none→n2
-t=11006.704ms n2→n1 AppendEntries term=18 leaderId=2 prevLogIndex=42 prevLogTerm=5 entries=[] leaderCommit=33
-t=11007.846ms n2→n1 AppendEntries term=18 leaderId=2 prevLogIndex=42 prevLogTerm=5 entries=[43@18] leaderCommit=33
-t=11013.848ms n1→n2 AppendEntriesResponse term=18 success=false prevLogIndex=42 conflictTerm=0 conflictIndex=34
-t=11013.915ms n1→n2 AppendEntriesResponse term=18 success=false prevLogIndex=42 conflictTerm=0 conflictIndex=34
-t=11022.171ms n2→n1 AppendEntries term=18 leaderId=2 prevLogIndex=33 prevLogTerm=5 entries=[34@5 35@5 36@5 37@5 38@5 39@5 40@5 41@5 42@5 43@18] leaderCommit=33
-t=11027.234ms n1→n2 AppendEntriesResponse term=18 success=true matchIndex=43
-t=11027.234ms n2 leader term=18 leader=n2 commitIndex=33→43 lastApplied=33→43
+t=0.000ms n1 boot term=0 votedFor=none snapshot=0 lastIndex=0 tick=11.280ms
+t=327.168ms n2 candidate→leader term=1 leader=none→n2
+t=344.396ms n2 compact lastIncludedIndex=1
+t=344.396ms n2 leader term=1 leader=n2 commitIndex=0→1 lastApplied=0→1
+t=8340.824ms n2 will crash during disk operation 1 from now
+t=8453.690ms n2 crash during a disk write
+t=8774.511ms n1 crash
+t=10015.462ms heal
+t=10015.462ms n1 boot term=12 votedFor=n2 snapshot=21 lastIndex=21 tick=11.280ms
+t=10015.462ms n2 msg="storage: truncated a record torn by a crash at the end of the WAL" segment=000000000000002d.wal offset=995 bytes=22
+t=10015.462ms n2 boot term=12 votedFor=n2 snapshot=21 lastIndex=47 tick=9.690ms
+t=10403.075ms n2 candidate→leader term=13 leader=none→n2
+t=10408.976ms n2→n1 AppendEntries term=13 leaderId=2 prevLogIndex=47 prevLogTerm=1 entries=[] leaderCommit=21
+t=10408.976ms n2 propose v48: index=48 term=13
+t=10409.119ms n2 propose v49: index=49 term=13
+t=10412.489ms n2→n1 AppendEntries term=13 leaderId=2 prevLogIndex=47 prevLogTerm=1 entries=[48@13] leaderCommit=21
+t=10418.451ms n1→n2 AppendEntriesResponse term=13 success=false prevLogIndex=47 conflictTerm=0 conflictIndex=22
+t=10418.594ms n1→n2 AppendEntriesResponse term=13 success=false prevLogIndex=47 conflictTerm=0 conflictIndex=22
+t=10425.867ms n2→n1 AppendEntries term=13 leaderId=2 prevLogIndex=21 prevLogTerm=1 entries=[22@1 23@1 24@1] leaderCommit=21
+t=10427.966ms n1→n2 AppendEntriesResponse term=13 success=true matchIndex=24
+t=10523.688ms n2→n1 AppendEntries term=13 leaderId=2 prevLogIndex=45 prevLogTerm=1 entries=[46@1 47@1 48@13] leaderCommit=21
+t=10526.308ms n2 leader term=13 leader=n2 commitIndex=21→48 lastApplied=21→48
 ```
 
-Seed 31 compacts after every entry and sends snapshots in 16-byte chunks. In its last lines, n1's log ends at index 33, exactly where n2's snapshot ends. n1 refuses both a heartbeat and a proposal that probe at entry 42. n2 acts on the first rejection, ignores the second because it answers the same probe, and sends the entries after 33, so no snapshot is needed.
+Seed 306 runs two servers that compact after every entry, with leaders sending at most three entries per AppendEntries. Near the end of the fault phase both crash, n2 in the middle of a disk write, and both restart when the faults heal; n2's recovery truncates the record its crash tore. n1's log then ends at index 21, exactly where both snapshots end. n1 refuses both a heartbeat and a proposal that probe at entry 47. n2 acts on the first rejection, ignores the second because it answers the same probe, and sends the entries after 21 three at a time, so no snapshot is needed. The next proposal, entry 49, is not sent on its own, because n1 is still owed entry 48; it follows in a later batch. Entry 48, the first of n2's own term, commits once both servers store it, and every entry before it commits with it (§5.4.2).
 
 - `t=` is virtual time since the run began, in milliseconds to the microsecond.
 - `boot` starts a server from its snapshot and write-ahead log, showing the term and vote it restored, its snapshot's last included index (0 for none), its last log index, and its skewed tick interval. `crash` stops a server between events. `will crash during disk operation N from now` sets a crash to strike during the server's Nth disk operation from then, and `crash during a disk write` is that crash striking.
@@ -134,13 +137,38 @@ This reruns seed N alone and logs its trace with every message added. A delivery
 
 ### Scripted scenarios
 
-`sim.New` builds a cluster for a scripted test, with `Options` for its size, seed, compaction threshold, and snapshot chunk size. `RunFor`, `RunUntil`, `Propose`, `Partition`, `Cut`, `Heal`, `Crash`, `CrashDuringDiskOp`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples. `TestCrashesMidWriteKeepSafety` crashes a server mid-write every 200 ms in a cluster of five taking proposals and compacting every three entries, about 900 crashes over its ten seeds, and then requires the cluster to commit a new command everywhere. `TestLaggingServerCatchesUpThroughSnapshot` cuts a server off while the others commit and compact thirty commands, then requires it to catch up from the leader's snapshot, sent in 16-byte chunks.
+`sim.New` builds a cluster for a scripted test, with `Options` for its size, seed, compaction threshold, and snapshot chunk size. `RunFor`, `RunUntil`, `Propose`, `Partition`, `Cut`, `Heal`, `Crash`, `CrashDuringDiskOp`, `Restart`, and `SetNetwork` drive it, and `Status`, `AgreedLeader`, and `Leaders` inspect it. `TestIsolatedLeaderIsReplaced`, `TestMinorityPartitionNeverElects`, `TestCrashedLeaderIsReplaced`, and `TestElectsLeaderDespiteLossAndDuplication` are examples. `TestCrashesMidWriteKeepSafety` crashes a server mid-write every 200 ms in a cluster of five taking proposals and compacting every three entries, about 900 crashes over its ten seeds, and then requires the cluster to commit a new command everywhere. `TestLaggingServerCatchesUpThroughSnapshot` cuts a server off while the others commit and compact thirty commands, then requires it to catch up from the leader's snapshot, sent in 16-byte chunks. `TestProposalBurstSendsFewAppendEntries` proposes twelve commands at one instant and counts the AppendEntries each follower receives until every server applies them: two or three, where a leader that resent unacknowledged entries on every proposal sent 14 to 18. It allows six.
 
 ## MIT 6.5840 test suites
 
-Not built yet. MIT's 6.5840 course publishes test suites for Raft (Lab 3, parts 3A–3D) and for a key-value service on top of it (Lab 4, parts 4A–4C). Running them against this code gives evidence from tests written by someone else.
+MIT's 6.5840 course publishes test suites for Raft (Lab 3, parts 3A–3D) and for a key-value service on top of it (Lab 4, parts 4A–4C). Running them against this code gives evidence from tests written by someone else, with limits of their own: at most ten heartbeats a second, a new leader within five seconds of a failure, few RPCs per agreement and few bytes per command, a small persisted state once snapshots begin, at most 120 seconds for any test, and at most 600 seconds for a whole lab. Lab 3 runs today; Lab 4 waits for the key-value service.
 
-The course asks that solutions not be published. This repository is public, so the adapter that connects the course's API to this code lives in a separate private repository, and no course source is ever committed here. The course checkout goes in `.mitlab/`, which git ignores.
+**Keep the adapter private.** The course asks that solutions not be published, and this repository is public. The adapter that connects the course's API to this code therefore lives in a separate private repository, and no course source is ever committed here or pushed anywhere. The course checkout goes in `.mitlab/`, which git ignores. Never copy course files, or the adapter, into a tracked directory.
+
+**Setup.** You need git, Go, and a checkout of the private adapter. [scripts/mitlab.sh](../scripts/mitlab.sh) clones the course repository into `.mitlab/` once, over `git://`, so the network must let git's port 9418 through. On every invocation it resets the clone to a pinned commit, copies the adapter's `raft1/raft.go` over the course's skeleton, and adds a `replace` directive that points the course module at this checkout. `go get` then raises the course module's `go` line to this module's, as Go requires of a module that depends on a newer one; the raised line turns on a vet check that the course's own test files fail, so the tests run with `-vet=off`. Each part runs with `-race`:
+
+```sh
+MITLAB_ADAPTER=../wilson-mitlab make mitlab PART=3B           # one part: 3A, 3B, 3C, or 3D
+MITLAB_ADAPTER=../wilson-mitlab make mitlab RUNS=20           # all of Lab 3, twenty times
+MITLAB_ADAPTER=../wilson-mitlab scripts/mitlab.sh -n 20 -p 4  # the same, four runs at a time
+```
+
+**The adapter.** In the course's tests each Raft peer runs in a process of its own, and the test process relays every RPC through a simulated network that delays, drops, reorders, and partitions. The adapter is the runtime for one core in such a process, playing the part `node/` plays in `kvnode`. It configures the core with `raft.MITLabConfig()`, ticks it every 10 ms, and maps `Start`, `GetState`, and `Snapshot` onto `Propose`, `Status`, and `Compact`. After every call into the core it handles the `Ready` in the contract's order: it saves the hard state, the snapshot's index and term, and the log after it, together with the snapshot, in one call to the course's persister; then it sends the messages; then it queues the committed entries, and any snapshot from the leader, for a goroutine that delivers them to the tests in order. Each Raft RPC is a single call of the course's RPC library, with the core's response as its reply, because the tests count calls and a response sent as a message of its own would double them. Every peer process is built with the race detector, and the script fails a run whose output reports a data race, even if every test passed.
+
+**The repeat runner.** With `-n N`, the script runs the part N times, `-p` at a time, logs each run under `.mitlab/logs/`, and prints how many runs each test passed, each test's longest time, and the slowest run. It exits non-zero if any run failed.
+
+**Results.** Against the course's tests at the pinned commit (February 2026), all of Lab 3 passes twenty runs in a row with `-race`, four at a time on a 10-core Mac: 560 test runs, with no failure and no data race. The slowest test took 56.3 s (`TestSnapshotInstallUnreliable3D`), against the course's limit of 120 s, and a whole run took 381 to 405 s, a mean of 392 s, against its 600 s:
+
+| Part | Tests | Mean time | Slowest |
+| --- | --- | --- | --- |
+| 3A, elections | 3 | 15.4 s | 16.5 s |
+| 3B, agreement | 10 | 48.8 s | 50.8 s |
+| 3C, persistence | 8 | 138.3 s | 145.5 s |
+| 3D, snapshots | 7 | 187.9 s | 195.7 s |
+
+The first run found one failure. `TestCount3B` counted 46 RPCs to agree on twelve commands, where it allows 42: the leader sent each follower its unacknowledged entries again on every proposal, and again on every reply that left the follower behind. `TestProposalBurstSendsFewAppendEntries` reproduces it in the simulator, and the leader now sends a new entry at once only to followers owed nothing earlier ([ARCHITECTURE.md](ARCHITECTURE.md#log-replication)). Lab 4 will be held to the same twenty runs, and a change to the core means running Lab 3 again.
+
+A failure found here is handled like any other heavyweight-harness failure: a scripted simulator test reproduces it first, then the core is fixed. The adapter changes only when the adapter itself is wrong.
 
 ## Porcupine linearizability checks
 

@@ -16,7 +16,7 @@ It runs gofmt, go vet, golangci-lint, the tests with `-race`, a short simulator 
 - **Never weaken, skip, or delete a test to make it pass.** Never add sleeps or retries to hide a timing bug. Treat a flaky test as a code bug until proven otherwise.
 - **Every bug found by a heavyweight harness** (the MIT suites, the chaos test, a random simulator seed) gets a small scripted regression test before the fix lands.
 - **Standard library first.** A runtime dependency needs an approved ADR. Porcupine is the one pre-approved test dependency.
-- **Never commit MIT 6.5840 course source.** [docs/TESTING.md](docs/TESTING.md#mit-65840-test-suites) explains why.
+- **Never commit MIT 6.5840 course source**, or the private adapter that runs the course's tests. [docs/TESTING.md](docs/TESTING.md#mit-65840-test-suites) explains why.
 
 ## Writing code
 

@@ -204,7 +204,7 @@ Each server snapshots its own state machine (§7), and a leader sends its snapsh
 
 ## Time
 
-The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)). The runtime ticks the core from a wall-clock ticker, which skips a tick the node is too busy to take rather than queue it. A message between two servers on one network takes about a millisecond, far below the heartbeat interval, as §5.6 requires.
+The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)). The runtime ticks the core from a wall-clock ticker, which skips a tick the node is too busy to take rather than queue it. A message between two servers on one network takes about a millisecond, far below the heartbeat interval, as §5.6 requires. `MITLabConfig` is the preset for MIT 6.5840's Lab 3 tests: the same 10 ms tick, a heartbeat every 10 ticks (100 ms, as often as the lab allows), election timeouts drawn from [40, 80) ticks ([400 ms, 800 ms)), each snapshot sent whole, and no cap on the entries an AppendEntries carries. That suits the lab's RPC library, which has no size limit, but not the HTTP transport, so `kvnode` offers only `default`.
 
 - **Election timer.** Each timeout is drawn uniformly from [`ElectionTick`, 2 × `ElectionTick`) ticks with the injected `*rand.Rand`, again at every reset (§5.2). A follower's timer restarts only when it hears an AppendEntries from the current leader or grants a vote; a candidate's restarts when it starts an election (Figure 2). A refused vote never restarts it, so a candidate that cannot win cannot hold off an election by asking.
 - **Heartbeats.** A leader sends an empty AppendEntries to every other server as soon as it is elected, then every `HeartbeatTick` ticks. `HeartbeatTick` must be below `ElectionTick`, so a follower hears from a healthy leader before it times out.
@@ -242,7 +242,7 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 | File | Contents |
 | --- | --- |
 | [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `Snapshot`, `HardState`, `Message` and the RPC structs, `Ready` |
-| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions |
+| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `MITLabConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions |
 | [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, batches capped by `MaxAppendSize`, the merge that carries out AppendEntries steps 3 and 4, and `restore`, which carries out Figure 13's steps 6 and 7 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
 | [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, following the current leader, the leader's handling of replies, fast backtracking, and the commit rule |

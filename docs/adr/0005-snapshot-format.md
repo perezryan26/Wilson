@@ -57,7 +57,7 @@ A crash before step 2's rename leaves the old WAL and old snapshot, and recovery
 
 ### InstallSnapshot
 
-- **Chunks.** `InstallSnapshotRequest` has Figure 13's fields: `Term`, `LeaderID`, `LastIncludedIndex`, `LastIncludedTerm`, `Offset`, `Data`, and `Done`. `Config.SnapshotChunkSize` bounds a chunk; 0 sends the whole snapshot in one message. `DefaultConfig` uses 1 MiB, and the MIT adapter will use 0, as the lab requires.
+- **Chunks.** `InstallSnapshotRequest` has Figure 13's fields: `Term`, `LeaderID`, `LastIncludedIndex`, `LastIncludedTerm`, `Offset`, `Data`, and `Done`. `Config.SnapshotChunkSize` bounds a chunk; 0 sends the whole snapshot in one message. `DefaultConfig` uses 1 MiB, and `MITLabConfig`, for the MIT 6.5840 tests, uses 0, as the lab requires.
 - **Replies.** `InstallSnapshotResponse` adds three fields to Figure 13's `Term`, so the reply names what it acknowledges, as `AppendEntriesResponse.MatchIndex` does ([ADR-0004](0004-fast-log-backtracking.md)):
   - `LastIncludedIndex` names the snapshot the reply answers.
   - `Offset` says how many of its bytes the follower holds.
