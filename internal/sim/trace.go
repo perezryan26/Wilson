@@ -101,14 +101,14 @@ func describe(m raft.Message) string {
 	case m.AppendEntries != nil:
 		r := m.AppendEntries
 		return fmt.Sprintf("AppendEntries term=%d leaderId=%d prevLogIndex=%d prevLogTerm=%d entries=%s leaderCommit=%d",
-			r.Term, r.LeaderID, r.PrevLogIndex, r.PrevLogTerm, entryNames(r.Entries), r.LeaderCommit)
+			r.Term, r.LeaderID, r.PrevLogIndex, r.PrevLogTerm, entryNames(r.Entries), r.LeaderCommit) + readRound(r.ReadRound)
 	case m.AppendEntriesResponse != nil:
 		r := m.AppendEntriesResponse
 		if r.Success {
-			return fmt.Sprintf("AppendEntriesResponse term=%d success=true matchIndex=%d", r.Term, r.MatchIndex)
+			return fmt.Sprintf("AppendEntriesResponse term=%d success=true matchIndex=%d", r.Term, r.MatchIndex) + readRound(r.ReadRound)
 		}
 		return fmt.Sprintf("AppendEntriesResponse term=%d success=false prevLogIndex=%d conflictTerm=%d conflictIndex=%d",
-			r.Term, r.PrevLogIndex, r.ConflictTerm, r.ConflictIndex)
+			r.Term, r.PrevLogIndex, r.ConflictTerm, r.ConflictIndex) + readRound(r.ReadRound)
 	case m.InstallSnapshot != nil:
 		r := m.InstallSnapshot
 		return fmt.Sprintf("InstallSnapshot term=%d leaderId=%d lastIncludedIndex=%d lastIncludedTerm=%d offset=%d bytes=%d done=%t",
@@ -119,6 +119,15 @@ func describe(m raft.Message) string {
 			r.Term, r.LastIncludedIndex, r.Offset, r.Done)
 	}
 	return "empty message"
+}
+
+// readRound prints an AppendEntries round of leadership checks for
+// reads, if the leader has begun one in its term.
+func readRound(round uint64) string {
+	if round == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" readRound=%d", round)
 }
 
 // entryNames prints entries as [index@term ...], such as [8@4 9@4], with

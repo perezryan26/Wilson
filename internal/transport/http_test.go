@@ -26,9 +26,10 @@ func everyRPC(from, to raft.NodeID) []raft.Message {
 		{From: from, To: to, RequestVoteResponse: &raft.RequestVoteResponse{Term: 2, VoteGranted: true}},
 		{From: from, To: to, AppendEntries: &raft.AppendEntriesRequest{
 			Term: 2, LeaderID: from, PrevLogIndex: 7, PrevLogTerm: 1,
-			Entries: []raft.Entry{{Index: 8, Term: 2, Data: []byte("x=1")}, {Index: 9, Term: 2}}, LeaderCommit: 7,
+			Entries: []raft.Entry{{Index: 8, Term: 2, Data: []byte("x=1")}, {Index: 9, Term: 2, Type: raft.EntryNoOp}}, LeaderCommit: 7,
+			ReadRound: 3,
 		}},
-		{From: from, To: to, AppendEntriesResponse: &raft.AppendEntriesResponse{Term: 2, PrevLogIndex: 7, ConflictTerm: 1, ConflictIndex: 4}},
+		{From: from, To: to, AppendEntriesResponse: &raft.AppendEntriesResponse{Term: 2, PrevLogIndex: 7, ConflictTerm: 1, ConflictIndex: 4, ReadRound: 3}},
 		{From: from, To: to, InstallSnapshot: &raft.InstallSnapshotRequest{
 			Term: 2, LeaderID: from, LastIncludedIndex: 7, LastIncludedTerm: 1, Offset: 3, Data: []byte{0, 1, 255}, Done: true,
 		}},

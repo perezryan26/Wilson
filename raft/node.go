@@ -51,7 +51,8 @@ type Config struct {
 	// entry commits, so does every entry before it (§5.4.2), so the
 	// leader learns at once which entries are committed, and a cluster
 	// that restarts applies its committed entries without waiting for a
-	// new command.
+	// new command. Without it, reads through ReadIndex wait until a
+	// command of the leader's term commits.
 	CommitNoOpOnElection bool
 }
 
@@ -190,6 +191,15 @@ type Node struct {
 	// 2–4): the bytes so far, and the term of the leader sending them.
 	partial     *Snapshot
 	partialTerm Term
+
+	// A leader's reads through ReadIndex (§8), reset after each election:
+	// its latest round of leadership checks, the latest round each server
+	// has answered, and the reads still waiting, oldest first.
+	readRound uint64
+	readAcks  map[NodeID]uint64
+	reads     []pendingRead
+	// readStates are the confirmed reads for the next Ready.
+	readStates []ReadState
 
 	role   Role
 	leader NodeID          // see Status.Leader
@@ -356,6 +366,7 @@ func (n *Node) Ready() Ready {
 		rd.CommittedEntries = n.log.between(n.lastApplied+1, n.commitIndex)
 		n.lastApplied = n.commitIndex
 	}
+	rd.ReadStates, n.readStates = n.readStates, nil
 	if hs := (HardState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor}); hs != n.prevHardState {
 		rd.HardState = &hs
 		n.prevHardState = hs
@@ -382,7 +393,8 @@ func (n *Node) send(m Message) {
 
 // becomeFollower makes the node a follower in term, following leader, which
 // is None if unknown. A later term clears votedFor, because the node has not
-// voted in that term yet.
+// voted in that term yet. Reads a leader had not yet confirmed are
+// dropped: a follower serves none.
 func (n *Node) becomeFollower(term Term, leader NodeID) {
 	if term > n.currentTerm {
 		n.currentTerm = term
@@ -390,6 +402,7 @@ func (n *Node) becomeFollower(term Term, leader NodeID) {
 	}
 	n.role = Follower
 	n.leader = leader
+	n.reads = nil
 }
 
 // becomeCandidate makes the node a candidate for the next term: it
@@ -414,6 +427,7 @@ func (n *Node) becomeLeader() {
 	n.nextIndex = map[NodeID]Index{}
 	n.matchIndex = map[NodeID]Index{}
 	n.transfers = map[NodeID]*transfer{}
+	n.readRound, n.readAcks = 0, map[NodeID]uint64{}
 	for _, id := range n.peers {
 		n.nextIndex[id] = n.log.lastIndex() + 1
 	}

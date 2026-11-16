@@ -118,6 +118,12 @@ type AppendEntriesRequest struct {
 	PrevLogTerm  Term    // term of the PrevLogIndex entry
 	Entries      []Entry // log entries to store; empty for a heartbeat
 	LeaderCommit Index   // leader's commitIndex
+
+	// ReadRound is the leader's latest round of leadership checks for
+	// reads when it sent the request, which the follower's reply echoes:
+	// a read is served once a majority has answered a request sent after
+	// the read arrived (§8; docs/adr/0008-read-path.md).
+	ReadRound uint64
 }
 
 // AppendEntriesResponse holds the results of the AppendEntries RPC.
@@ -147,6 +153,10 @@ type AppendEntriesResponse struct {
 	// index + 1.
 	ConflictTerm  Term
 	ConflictIndex Index
+
+	// ReadRound echoes the request's ReadRound, on success or a rejection
+	// for a log inconsistency.
+	ReadRound uint64
 }
 
 // InstallSnapshotRequest holds the arguments of the InstallSnapshot RPC,
@@ -210,4 +220,9 @@ type Ready struct {
 	// commitIndex > lastApplied, apply log[lastApplied]). Each entry comes
 	// out exactly once per boot.
 	CommittedEntries []Entry
+	// ReadStates are the reads that ReadIndex asked about and the leader
+	// has since confirmed. Each may be served from the state machine once
+	// it has applied the read's Index, which applying this Ready's
+	// CommittedEntries always reaches.
+	ReadStates []ReadState
 }

@@ -36,6 +36,7 @@ func (n *Node) sendAppend(to NodeID) {
 		PrevLogTerm:  prevTerm,
 		Entries:      n.log.batch(next, n.maxAppendSize),
 		LeaderCommit: n.commitIndex,
+		ReadRound:    n.readRound,
 	}})
 }
 
@@ -51,7 +52,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm (§5.3).
 	if !n.hasEntry(req.PrevLogIndex, req.PrevLogTerm) {
-		n.rejectConflict(req.LeaderID, req.PrevLogIndex)
+		n.rejectConflict(req)
 		return
 	}
 	// 3. If an existing entry conflicts with a new one (same index but
@@ -69,6 +70,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) {
 		Term:       n.currentTerm,
 		Success:    true,
 		MatchIndex: lastNew,
+		ReadRound:  req.ReadRound,
 	}})
 }
 
@@ -102,16 +104,22 @@ func (n *Node) rejectAppend(to NodeID) {
 	n.send(Message{To: to, AppendEntriesResponse: &AppendEntriesResponse{Term: n.currentTerm}})
 }
 
-// rejectConflict refuses an AppendEntries whose PrevLogIndex entry this log
-// lacks or holds with another term, and says where the logs part
+// rejectConflict refuses req, whose PrevLogIndex entry this log lacks or
+// holds with another term, and says where the logs part
 // (docs/adr/0004-fast-log-backtracking.md).
-func (n *Node) rejectConflict(to NodeID, prevIndex Index) {
-	resp := &AppendEntriesResponse{Term: n.currentTerm, PrevLogIndex: prevIndex, ConflictIndex: n.log.lastIndex() + 1}
+func (n *Node) rejectConflict(req *AppendEntriesRequest) {
+	prevIndex := req.PrevLogIndex
+	resp := &AppendEntriesResponse{
+		Term:          n.currentTerm,
+		PrevLogIndex:  prevIndex,
+		ConflictIndex: n.log.lastIndex() + 1,
+		ReadRound:     req.ReadRound,
+	}
 	if prevIndex <= n.log.lastIndex() {
 		resp.ConflictTerm, _ = n.log.term(prevIndex)
 		resp.ConflictIndex = n.log.firstIndexOf(resp.ConflictTerm, prevIndex)
 	}
-	n.send(Message{To: to, AppendEntriesResponse: resp})
+	n.send(Message{To: req.LeaderID, AppendEntriesResponse: resp})
 }
 
 // handleAppendEntriesResponse applies Figure 2's rules for a leader that
@@ -124,6 +132,9 @@ func (n *Node) handleAppendEntriesResponse(from NodeID, resp *AppendEntriesRespo
 	if n.role != Leader || resp.Term != n.currentTerm {
 		return
 	}
+	// Any reply in this term, a rejection too, shows that the follower had
+	// not moved on to a later term when the request arrived (§8).
+	n.ackRead(from, resp.ReadRound)
 	if !resp.Success {
 		// The follower's log lacks or contradicts the entry at PrevLogIndex
 		// (§5.3). A rejection of an earlier probe than the latest, at
@@ -191,6 +202,7 @@ func (n *Node) maybeCommit() {
 	index := matched[(len(matched)-1)/2]
 	if term, _ := n.log.term(index); term == n.currentTerm {
 		n.commitTo(index)
+		n.confirmReads()
 	}
 }
 
