@@ -20,6 +20,7 @@ func sampleRecords() []record {
 		{typ: recordHardState},
 		{typ: recordEntry, entry: raft.Entry{Index: 1, Term: 1}},
 		{typ: recordEntry, entry: raft.Entry{Index: 42, Term: 9, Data: []byte("put x=1")}},
+		{typ: recordEntry, entry: raft.Entry{Index: 43, Term: 10, Type: raft.EntryNoOp}},
 		{typ: recordEntry, entry: raft.Entry{Index: 1 << 40, Term: 1 << 33, Data: bytes.Repeat([]byte{0xab}, 1000)}},
 		{typ: recordTruncate, index: 5},
 		{typ: recordSnapshot, hardState: raft.HardState{CurrentTerm: 5, VotedFor: 1}, index: 40, term: 4},
@@ -98,8 +99,10 @@ func TestMalformedRecordIsDamaged(t *testing.T) {
 		b := append([]byte{byte(recordEntry)}, make([]byte, 16)...)
 		return append(b, byte(entryType), 'x')
 	}
-	if _, _, err := decodeRecord(frame(entry(raft.EntryNormal))); err != nil {
-		t.Fatalf("a well-formed entry failed to decode: %v", err)
+	for _, typ := range []raft.EntryType{raft.EntryNormal, raft.EntryNoOp} {
+		if _, _, err := decodeRecord(frame(entry(typ))); err != nil {
+			t.Fatalf("a well-formed entry of type %d failed to decode: %v", typ, err)
+		}
 	}
 	cases := map[string][]byte{
 		"empty":                       make([]byte, headerSize),
@@ -111,7 +114,7 @@ func TestMalformedRecordIsDamaged(t *testing.T) {
 		"entry, 16-byte payload":      frame(append([]byte{byte(recordEntry)}, make([]byte, 16)...)),
 		"snapshot, 31-byte payload":   frame(append([]byte{byte(recordSnapshot)}, make([]byte, 31)...)),
 		"snapshot, 33-byte payload":   frame(append([]byte{byte(recordSnapshot)}, make([]byte, 33)...)),
-		"entry of unknown entry type": frame(entry(1)),
+		"entry of unknown entry type": frame(entry(raft.EntryNoOp + 1)),
 	}
 	for name, b := range cases {
 		if _, _, err := decodeRecord(b); err == nil || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -161,6 +164,8 @@ func TestRecordBytes(t *testing.T) {
 			"11000000 0be58904 01 0300000000000000 0200000000000000"},
 		{record{typ: recordEntry, entry: raft.Entry{Index: 7, Term: 3, Data: []byte("x=1")}},
 			"15000000 88fb3f2f 02 0700000000000000 0300000000000000 00 783d31"},
+		{record{typ: recordEntry, entry: raft.Entry{Index: 8, Term: 4, Type: raft.EntryNoOp}},
+			"12000000 5887ad0f 02 0800000000000000 0400000000000000 01"},
 		{record{typ: recordTruncate, index: 5},
 			"09000000 c09b6bca 03 0500000000000000"},
 		{record{typ: recordSnapshot, hardState: raft.HardState{CurrentTerm: 3, VotedFor: 2}, index: 7, term: 3},

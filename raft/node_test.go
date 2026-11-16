@@ -10,9 +10,12 @@ import (
 )
 
 // testConfig returns the default timing for server id of a cluster of
-// servers 1 to size, with a random source seeded by seed and the ID.
+// servers 1 to size, with a random source seeded by seed and the ID. The
+// election no-op is off, so that a new leader's log is exactly what the
+// test gave it; the no-op's own tests turn it on.
 func testConfig(id NodeID, size int, seed uint64) Config {
 	cfg, _ := DefaultConfig()
+	cfg.CommitNoOpOnElection = false
 	cfg.ID = id
 	for p := range NodeID(size) {
 		cfg.Peers = append(cfg.Peers, p+1)
@@ -159,7 +162,7 @@ func TestNewNodeRejectsInvalidConfig(t *testing.T) {
 
 // MITLabConfig keeps to MIT 6.5840 Lab 3's limits: at most ten heartbeats
 // a second, elections that leave room for a split vote or two within the
-// five seconds the lab allows, and whole snapshots.
+// five seconds the lab allows, whole snapshots, and no election no-op.
 func TestMITLabConfigKeepsLabLimits(t *testing.T) {
 	cfg, tick := MITLabConfig()
 	if hb := time.Duration(cfg.HeartbeatTick) * tick; hb < 100*time.Millisecond {
@@ -170,6 +173,9 @@ func TestMITLabConfigKeepsLabLimits(t *testing.T) {
 	}
 	if cfg.SnapshotChunkSize != 0 {
 		t.Errorf("SnapshotChunkSize = %d, want 0: the lab sends each snapshot whole", cfg.SnapshotChunkSize)
+	}
+	if cfg.CommitNoOpOnElection {
+		t.Error("the election no-op is on, but the lab checks which command occupies each log index")
 	}
 	cfg.ID, cfg.Peers, cfg.Rand = 1, []NodeID{1, 2, 3}, rand.New(rand.NewPCG(1, 1))
 	if err := cfg.validate(); err != nil {
@@ -199,7 +205,7 @@ func TestNewNodeRestoresHardState(t *testing.T) {
 func wantEntries(t *testing.T, what string, got, want []Entry) {
 	t.Helper()
 	same := slices.EqualFunc(got, want, func(a, b Entry) bool {
-		return a.Index == b.Index && a.Term == b.Term && string(a.Data) == string(b.Data)
+		return a.Index == b.Index && a.Term == b.Term && a.Type == b.Type && string(a.Data) == string(b.Data)
 	})
 	if !same {
 		t.Errorf("%s = %v, want %v", what, got, want)

@@ -315,8 +315,10 @@ func TestFileStorageRefusesStaleSnapshots(t *testing.T) {
 type replica struct {
 	storage  *FileStorage
 	node     *raft.Node
-	state    []string
+	state    []string   // the commands applied, in order; no-ops are skipped
+	applied  raft.Index // the last index applied
 	snapshot raft.Index // the last index the latest snapshot includes
+	restored []string   // the commands the snapshot it restarted from held
 }
 
 // startReplica restarts a replica from the file storage on fsys: its
@@ -330,7 +332,7 @@ func startReplica(t *testing.T, fsys FS, seed uint64) *replica {
 		if err := json.Unmarshal(s.Data, &r.state); err != nil {
 			t.Fatal(err)
 		}
-		r.snapshot = s.LastIncludedIndex
+		r.applied, r.snapshot, r.restored = s.LastIncludedIndex, s.LastIncludedIndex, slices.Clone(r.state)
 	}
 	cfg, _ := raft.DefaultConfig()
 	cfg.ID, cfg.Peers, cfg.Rand = 1, []raft.NodeID{1}, rand.New(rand.NewPCG(seed, 1))
@@ -350,10 +352,13 @@ func (r *replica) handleReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range rd.CommittedEntries {
-		if e.Index != raft.Index(len(r.state))+1 {
-			t.Fatalf("applied entry %d after %d commands", e.Index, len(r.state))
+		if e.Index != r.applied+1 {
+			t.Fatalf("applied entry %d after entry %d", e.Index, r.applied)
 		}
-		r.state = append(r.state, string(e.Data))
+		r.applied = e.Index
+		if e.Type == raft.EntryNormal {
+			r.state = append(r.state, string(e.Data))
+		}
 	}
 }
 
@@ -361,7 +366,7 @@ func (r *replica) handleReady(t *testing.T) {
 // last snapshot.
 func (r *replica) compact(t *testing.T) {
 	t.Helper()
-	index := raft.Index(len(r.state))
+	index := r.applied
 	if index == r.snapshot {
 		return
 	}
@@ -380,9 +385,10 @@ func (r *replica) compact(t *testing.T) {
 // up with the state that replaying the whole log gives. A replica
 // proposes commands, compacts after some of them, and restarts at random
 // from a disk that crashed, rebuilding its state machine from its
-// snapshot and applying the entries after it. Every restart's snapshot
-// must hold exactly the commands it includes, and at the end the state
-// machine must hold every command, in order.
+// snapshot and applying the entries after it, among them the no-op each
+// of its terms begins with. Every restart's snapshot must hold exactly
+// the commands it includes, and at the end the state machine must hold
+// every command, in order.
 func TestRestoreEqualsFullReplay(t *testing.T) {
 	restarts := 0
 	for seed := range uint64(20) {
@@ -390,12 +396,14 @@ func TestRestoreEqualsFullReplay(t *testing.T) {
 		fsys := NewFaultFS(rand.New(rand.NewPCG(seed, 3)))
 		r := startReplica(t, fsys, seed)
 		var proposed []string
+		var at []raft.Index // the index of each proposed command
 		for i := range 150 {
 			cmd := fmt.Sprintf("c%d", i)
-			if _, _, err := r.node.Propose([]byte(cmd)); err != nil {
+			index, _, err := r.node.Propose([]byte(cmd))
+			if err != nil {
 				t.Fatal(err)
 			}
-			proposed = append(proposed, cmd)
+			proposed, at = append(proposed, cmd), append(at, index)
 			r.handleReady(t)
 			if pick.IntN(4) == 0 {
 				r.compact(t)
@@ -404,13 +412,15 @@ func TestRestoreEqualsFullReplay(t *testing.T) {
 				fsys.Crash()
 				r = startReplica(t, fsys, seed)
 				restarts++
-				if !slices.Equal(r.state, proposed[:r.snapshot]) {
-					t.Fatalf("seed %d: restarted from a snapshot through %d holding %v", seed, r.snapshot, r.state)
+				included := proposed[:len(at)-len(slices.DeleteFunc(slices.Clone(at), func(i raft.Index) bool { return i <= r.snapshot }))]
+				if !slices.Equal(r.restored, included) {
+					t.Fatalf("seed %d: restarted from a snapshot through %d holding %v", seed, r.snapshot, r.restored)
+				}
+				if !slices.Equal(r.state, proposed[:len(r.state)]) {
+					t.Fatalf("seed %d: restarted and applied %v", seed, r.state)
 				}
 			}
 		}
-		// After a restart, entries of earlier terms commit with the first
-		// entry of the new term (Figure 8).
 		if _, _, err := r.node.Propose([]byte("last")); err != nil {
 			t.Fatal(err)
 		}

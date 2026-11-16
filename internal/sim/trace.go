@@ -121,11 +121,15 @@ func describe(m raft.Message) string {
 	return "empty message"
 }
 
-// entryNames prints entries as [index@term ...], such as [8@4 9@4].
+// entryNames prints entries as [index@term ...], such as [8@4 9@4], with
+// a no-op marked as such: [8@4:no-op].
 func entryNames(entries []raft.Entry) string {
 	names := make([]string, len(entries))
 	for i, e := range entries {
 		names[i] = fmt.Sprintf("%d@%d", e.Index, e.Term)
+		if e.Type == raft.EntryNoOp {
+			names[i] += ":no-op"
+		}
 	}
 	return "[" + strings.Join(names, " ") + "]"
 }

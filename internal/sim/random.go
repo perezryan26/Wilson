@@ -25,10 +25,11 @@ const (
 // compact their logs as often as every entry, or never, all alike or in
 // half the seeds each on its own schedule, and send snapshots whole or in
 // small chunks and entries all at once or three at a time, as the seed
-// chooses. Then every fault heals, and within ten seconds the servers
-// must agree on a leader, and within ten more apply a command proposed to
-// it. RunRandomized returns the cluster, whose trace tells what happened,
-// and the first violation or liveness failure. traceMessages adds every
+// chooses. In half the seeds each new leader commits a no-op. Then every
+// fault heals, and within ten seconds the servers must agree on a
+// leader, and within ten more apply a command proposed to it.
+// RunRandomized returns the cluster, whose trace tells what happened, and
+// the first violation or liveness failure. traceMessages adds every
 // message to the trace.
 func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 	thresholds := []int{0, 1, 2, 4, 8}
@@ -40,6 +41,9 @@ func RunRandomized(seed uint64, traceMessages bool) (*Cluster, error) {
 		SnapshotChunkSize: []int{0, 16, 128}[seed/25%3],
 		// Three entries' worth, so leaders send logs in small batches.
 		MaxAppendSize: []int{0, 210}[seed/300%2],
+		// Without the no-op, a new leader commits entries of earlier terms
+		// only with a command of its own, which Figure 8's hazard needs.
+		CommitNoOpOnElection: seed/2%2 == 0,
 	})
 	if seed/150%2 == 1 {
 		// Servers that compact on schedules of their own leave a follower

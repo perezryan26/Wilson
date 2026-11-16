@@ -18,9 +18,15 @@ const None NodeID = 0
 // EntryType says what a log entry holds.
 type EntryType uint8
 
-// EntryNormal is the type of an entry that holds a command for the state
-// machine.
-const EntryNormal EntryType = 0
+const (
+	// EntryNormal is the type of an entry that holds a command for the
+	// state machine.
+	EntryNormal EntryType = 0
+	// EntryNoOp is the type of the entry a new leader appends at the start
+	// of its term when Config.CommitNoOpOnElection is set. It holds no
+	// command, and the state machine skips it.
+	EntryNoOp EntryType = 1
+)
 
 // Entry is one log entry: a command for the state machine and the term in
 // which the leader received it (Figure 2).

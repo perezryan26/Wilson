@@ -18,7 +18,8 @@ import (
 	"github.com/perezryan26/wilson/raft"
 )
 
-// commands is a state machine that keeps the list of commands applied.
+// commands is a state machine that keeps the list of entries applied,
+// one string per log index: the command, or noOp for an election no-op.
 // The node's goroutine applies to it while tests read it.
 type commands struct {
 	mu       sync.Mutex
@@ -26,9 +27,16 @@ type commands struct {
 	restores int // how many times a snapshot replaced the list
 }
 
+// noOp stands for an election no-op in a commands list.
+const noOp = "(no-op)"
+
 func (c *commands) Apply(e raft.Entry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if e.Type == raft.EntryNoOp {
+		c.list = append(c.list, noOp)
+		return
+	}
 	c.list = append(c.list, string(e.Data))
 }
 
@@ -196,7 +204,8 @@ func (c *cluster) tryPropose(cmd string) (raft.Index, error) {
 }
 
 // applied waits until every running server has applied index, and
-// returns their state machines' lists of commands, which must agree.
+// returns the commands their state machines applied through it, which
+// must agree, without the election no-ops.
 func (c *cluster) applied(index raft.Index) []string {
 	c.t.Helper()
 	waitFor(c.t, fmt.Sprintf("every server to apply index %d", index), func() bool {
@@ -221,7 +230,7 @@ func (c *cluster) applied(index raft.Index) []string {
 			c.t.Fatalf("server %d applied %v, another server %v", id+1, got, want)
 		}
 	}
-	return want
+	return slices.DeleteFunc(want, func(cmd string) bool { return cmd == noOp })
 }
 
 // waitFor fails the test unless done reports true within ten seconds,
@@ -353,7 +362,7 @@ type events struct {
 	mu   sync.Mutex
 	list []string
 	fail bool          // makes every Save fail
-	hold chan struct{} // if not nil, a Save with entries waits until it is closed
+	hold chan struct{} // if not nil, a Save with a command waits until it is closed
 }
 
 func (ev *events) add(e string) {
@@ -388,7 +397,7 @@ func (r *recorder) Save(rd raft.Ready) error {
 	for _, e := range rd.Entries {
 		r.add(fmt.Sprintf("save entry %d", e.Index))
 	}
-	if r.hold != nil && len(rd.Entries) > 0 {
+	if r.hold != nil && slices.ContainsFunc(rd.Entries, func(e raft.Entry) bool { return e.Type == raft.EntryNormal }) {
 		<-r.hold
 	}
 	return r.mem.Save(rd)
@@ -473,7 +482,8 @@ func TestNodeStopsForGoodOnStorageError(t *testing.T) {
 
 // Propose answers only once the new entry is saved, so a caller never
 // learns of an entry this server could lose in a crash. The save of the
-// entry is held until the test lets it finish.
+// entry, which follows the server's election no-op, is held until the
+// test lets it finish.
 func TestProposeReturnsOnceTheEntryIsSaved(t *testing.T) {
 	leaktest.Check(t)
 	ev := &events{hold: make(chan struct{})}
@@ -486,7 +496,7 @@ func TestProposeReturnsOnceTheEntryIsSaved(t *testing.T) {
 		_, _, err := n.Propose(context.Background(), []byte("x"))
 		returned <- err
 	}()
-	waitFor(t, "the entry's save to begin", func() bool { return slices.Contains(ev.get(), "save entry 1") })
+	waitFor(t, "the entry's save to begin", func() bool { return slices.Contains(ev.get(), "save entry 2") })
 	select {
 	case err := <-returned:
 		t.Fatalf("Propose returned %v while its entry was still being saved", err)

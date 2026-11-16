@@ -112,6 +112,68 @@ func TestFigure8OldTermEntryNotCommittedByCounting(t *testing.T) {
 	})
 }
 
+// noOpConfig returns testConfig with the election no-op on.
+func noOpConfig(id NodeID, size int) Config {
+	cfg := testConfig(id, size, 1)
+	cfg.CommitNoOpOnElection = true
+	return cfg
+}
+
+// §8: a new leader that commits a no-op appends it as soon as it wins, an
+// entry of its term and of type EntryNoOp, with no command. The runtime
+// persists it with the Ready that carries the leader's first
+// AppendEntries, which hold it.
+func TestNewLeaderAppendsNoOp(t *testing.T) {
+	n := NewNode(noOpConfig(1, 3), RestoredState{HardState: HardState{CurrentTerm: 1}, Entries: logOf(1, 1)})
+	tickUntilElection(t, n)
+	n.Ready()
+	n.Step(voteResponse(2, 2, true))
+	rd := n.Ready()
+	noOp := []Entry{{Index: 3, Term: 2, Type: EntryNoOp}}
+	wantEntries(t, "Ready entries", rd.Entries, noOp)
+	if len(rd.Messages) != 2 {
+		t.Fatalf("Ready messages = %+v, want an AppendEntries to each follower", rd.Messages)
+	}
+	for _, m := range rd.Messages {
+		if m.AppendEntries == nil || m.AppendEntries.PrevLogIndex != 2 {
+			t.Fatalf("message to %d = %+v, want an AppendEntries after entry 2", m.To, m)
+		}
+		wantEntries(t, "the entries of the first AppendEntries", m.AppendEntries.Entries, noOp)
+	}
+}
+
+// §8 and §5.4.2: once a majority stores a new leader's no-op, every entry
+// before it commits with it, with no command from a client. In Figure 8's
+// (c), the leader of term 4 thus commits the entry of term 2 that it must
+// not commit by counting replicas, and S5 can no longer win.
+func TestNoOpCommitsEarlierTermEntries(t *testing.T) {
+	s := figure8Servers()
+	s[0] = NewNode(noOpConfig(1, 5), RestoredState{HardState: HardState{CurrentTerm: 3}, Entries: logOf(1, 2)})
+	tickUntilElection(t, s[0])
+	exchange(t, s[0], s[1], s[2])
+	if st := s[0].Status(); st.Role != Leader || st.Term != 4 || st.CommitIndex != 3 {
+		t.Fatalf("S1 status = %+v, want the leader of term 4 with its no-op at index 3 committed", st)
+	}
+	for _, n := range s[:3] {
+		if e := n.log.entries[3]; e.Term != 4 || e.Type != EntryNoOp {
+			t.Errorf("S%d holds %+v at index 3, want the no-op of term 4", n.id, e)
+		}
+	}
+	tickUntilElection(t, s[4])
+	exchange(t, s[1], s[2], s[3], s[4])
+	if st := s[4].Status(); st.Role == Leader {
+		t.Errorf("S5 won term %d without the committed entries", st.Term)
+	}
+}
+
+// A one-server cluster is its own majority, so its no-op commits, and the
+// Ready releases it, as soon as the server is elected.
+func TestSingleServerCommitsNoOpOnElection(t *testing.T) {
+	n := NewNode(noOpConfig(1, 1), RestoredState{})
+	tickUntilElection(t, n)
+	wantEntries(t, "Ready committed entries", n.Ready().CommittedEntries, []Entry{{Index: 1, Term: 1, Type: EntryNoOp}})
+}
+
 // Figure 2, all servers: committed entries are applied in index order. A
 // Ready releases each committed entry once, after the Entries and Messages
 // of the same Ready, which the runtime persists and sends first.

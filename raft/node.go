@@ -46,25 +46,40 @@ type Config struct {
 	// but always at least one, so Propose refuses a command whose entry
 	// alone would exceed the cap. Zero means no cap.
 	MaxAppendSize int
+	// CommitNoOpOnElection makes each new leader append an entry of type
+	// EntryNoOp, with no command, as soon as it is elected (§8). Once that
+	// entry commits, so does every entry before it (§5.4.2), so the
+	// leader learns at once which entries are committed, and a cluster
+	// that restarts applies its committed entries without waiting for a
+	// new command.
+	CommitNoOpOnElection bool
 }
 
 // DefaultConfig returns the settings for a cluster on one local network:
 // a tick every 10 ms, a heartbeat every 5 ticks (50 ms), election
-// timeouts drawn from [300 ms, 600 ms), and snapshots and entries sent
-// in messages of at most 1 MiB. The runtime calls Tick once per returned
-// interval, and the caller fills in ID, Peers, and Rand.
+// timeouts drawn from [300 ms, 600 ms), snapshots and entries sent in
+// messages of at most 1 MiB, and a no-op committed by each new leader.
+// The runtime calls Tick once per returned interval, and the caller
+// fills in ID, Peers, and Rand.
 func DefaultConfig() (Config, time.Duration) {
-	return Config{ElectionTick: 30, HeartbeatTick: 5, SnapshotChunkSize: 1 << 20, MaxAppendSize: 1 << 20}, 10 * time.Millisecond
+	return Config{
+		ElectionTick:         30,
+		HeartbeatTick:        5,
+		SnapshotChunkSize:    1 << 20,
+		MaxAppendSize:        1 << 20,
+		CommitNoOpOnElection: true,
+	}, 10 * time.Millisecond
 }
 
 // MITLabConfig returns the settings MIT 6.5840's Lab 3 tests require: a
 // tick every 10 ms; a heartbeat every 10 ticks (100 ms), the lab's limit
 // of ten a second; election timeouts drawn from [400 ms, 800 ms), well
-// inside the five seconds the lab allows for electing a new leader; and
-// each snapshot sent whole in one InstallSnapshot, as the lab requires.
-// Entries per AppendEntries are not capped, because the lab's RPC
-// library has no size limit, so this preset does not suit the HTTP
-// transport.
+// inside the five seconds the lab allows for electing a new leader; each
+// snapshot sent whole in one InstallSnapshot, as the lab requires; and no
+// election no-op, because the lab's tests check which command occupies
+// each log index. Entries per AppendEntries are not capped, because the
+// lab's RPC library has no size limit, so this preset does not suit the
+// HTTP transport.
 func MITLabConfig() (Config, time.Duration) {
 	return Config{ElectionTick: 40, HeartbeatTick: 10}, 10 * time.Millisecond
 }
@@ -144,13 +159,14 @@ type Status struct {
 // carries out the effects that Ready returns. It is not safe for
 // concurrent use.
 type Node struct {
-	id                NodeID
-	peers             []NodeID // every server, this one included, sorted
-	electionTick      int
-	heartbeatTick     int
-	rand              *rand.Rand
-	snapshotChunkSize int
-	maxAppendSize     int
+	id                   NodeID
+	peers                []NodeID // every server, this one included, sorted
+	electionTick         int
+	heartbeatTick        int
+	rand                 *rand.Rand
+	snapshotChunkSize    int
+	maxAppendSize        int
+	commitNoOpOnElection bool
 
 	// Persistent state on all servers (Figure 2), and the snapshot that
 	// replaced the log's earlier entries (§7), which a leader sends to
@@ -202,18 +218,19 @@ func NewNode(cfg Config, restored RestoredState) *Node {
 	}
 	hs := restored.HardState
 	n := &Node{
-		id:                cfg.ID,
-		peers:             slices.Sorted(slices.Values(cfg.Peers)),
-		electionTick:      cfg.ElectionTick,
-		heartbeatTick:     cfg.HeartbeatTick,
-		rand:              cfg.Rand,
-		snapshotChunkSize: cfg.SnapshotChunkSize,
-		maxAppendSize:     cfg.MaxAppendSize,
-		currentTerm:       hs.CurrentTerm,
-		votedFor:          hs.VotedFor,
-		log:               newLog(restored.Snapshot, restored.Entries),
-		snapshot:          restored.Snapshot,
-		prevHardState:     hs,
+		id:                   cfg.ID,
+		peers:                slices.Sorted(slices.Values(cfg.Peers)),
+		electionTick:         cfg.ElectionTick,
+		heartbeatTick:        cfg.HeartbeatTick,
+		rand:                 cfg.Rand,
+		snapshotChunkSize:    cfg.SnapshotChunkSize,
+		maxAppendSize:        cfg.MaxAppendSize,
+		commitNoOpOnElection: cfg.CommitNoOpOnElection,
+		currentTerm:          hs.CurrentTerm,
+		votedFor:             hs.VotedFor,
+		log:                  newLog(restored.Snapshot, restored.Entries),
+		snapshot:             restored.Snapshot,
+		prevHardState:        hs,
 	}
 	n.commitIndex = n.log.snapshotIndex()
 	n.lastApplied = n.commitIndex
@@ -389,7 +406,8 @@ func (n *Node) becomeCandidate() {
 
 // becomeLeader makes the node the leader of its current term, resets its
 // view of every follower's log, and sends the initial heartbeat that
-// establishes its authority (Figure 2, leaders).
+// establishes its authority (Figure 2, leaders), carrying the term's
+// no-op if the node commits one.
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.leader = n.id
@@ -398,6 +416,13 @@ func (n *Node) becomeLeader() {
 	n.transfers = map[NodeID]*transfer{}
 	for _, id := range n.peers {
 		n.nextIndex[id] = n.log.lastIndex() + 1
+	}
+	if n.commitNoOpOnElection {
+		// §8: a new leader holds every committed entry but may not know
+		// which they are until it commits an entry of its own term, which
+		// commits every entry before it (§5.4.2).
+		n.log.append(Entry{Index: n.log.lastIndex() + 1, Term: n.currentTerm, Type: EntryNoOp})
+		n.maybeCommit()
 	}
 	n.broadcastAppend()
 }

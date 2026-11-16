@@ -45,6 +45,10 @@ type Options struct {
 	// MaxAppendSize is each server's raft.Config.MaxAppendSize: the most
 	// entry bytes one AppendEntries carries, or no limit if it is 0.
 	MaxAppendSize int
+	// CommitNoOpOnElection is each server's
+	// raft.Config.CommitNoOpOnElection: whether each new leader commits a
+	// no-op entry at the start of its term.
+	CommitNoOpOnElection bool
 }
 
 // Cluster is a simulated raft cluster. It runs every server in one
@@ -59,8 +63,9 @@ type Cluster struct {
 
 	commands int // commands proposed so far, for naming the next
 
-	snapshotChunkSize int // see Options
-	maxAppendSize     int
+	snapshotChunkSize    int // see Options
+	maxAppendSize        int
+	commitNoOpOnElection bool
 
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
@@ -112,9 +117,10 @@ func New(opts Options) *Cluster {
 		leaders: map[raft.Term]raft.NodeID{},
 		entries: map[logKey]entryInfo{},
 
-		snapshotChunkSize: opts.SnapshotChunkSize,
-		maxAppendSize:     opts.MaxAppendSize,
-		traceMessages:     opts.TraceMessages,
+		snapshotChunkSize:    opts.SnapshotChunkSize,
+		maxAppendSize:        opts.MaxAppendSize,
+		commitNoOpOnElection: opts.CommitNoOpOnElection,
+		traceMessages:        opts.TraceMessages,
 	}
 	_, tick := raft.DefaultConfig()
 	for i := range opts.Size {
@@ -322,6 +328,7 @@ func (c *Cluster) boot(n *node) {
 	cfg.Rand = rand.New(rand.NewPCG(c.rng.Uint64(), c.rng.Uint64()))
 	cfg.SnapshotChunkSize = c.snapshotChunkSize
 	cfg.MaxAppendSize = c.maxAppendSize
+	cfg.CommitNoOpOnElection = c.commitNoOpOnElection
 	n.core = raft.NewNode(cfg, restored)
 	n.boots++
 	n.status = n.core.Status()

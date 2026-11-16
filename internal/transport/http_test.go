@@ -239,6 +239,10 @@ func TestHandlerChecksEveryMessage(t *testing.T) {
 // encode as long as they can.
 func TestEveryMessageFitsMaxMessageSize(t *testing.T) {
 	cfg, _ := raft.DefaultConfig()
+	// Each case needs a leader whose log holds exactly the entries it was
+	// given, so a proposal is every follower's next entry and leaves at
+	// once.
+	cfg.CommitNoOpOnElection = false
 	base := raft.Index(math.MaxUint64 - 1<<22)
 	entries := make([]raft.Entry, cfg.MaxAppendSize/16)
 	for i := range entries {

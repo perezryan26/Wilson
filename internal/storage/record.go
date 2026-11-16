@@ -120,15 +120,8 @@ func decodePayload(t recordType, p []byte) (record, error) {
 		hs := raft.HardState{CurrentTerm: raft.Term(le.Uint64(p)), VotedFor: raft.NodeID(le.Uint64(p[8:]))}
 		return record{typ: t, hardState: hs}, nil
 	case recordEntry:
-		if len(p) < 17 {
-			return record{}, payloadSizeError(t, p)
-		}
-		typ := raft.EntryType(p[16])
-		if typ != raft.EntryNormal {
-			return record{}, fmt.Errorf("entry of unknown type %d", typ)
-		}
-		e := raft.Entry{Index: raft.Index(le.Uint64(p)), Term: raft.Term(le.Uint64(p[8:])), Type: typ, Data: bytes.Clone(p[17:])}
-		return record{typ: t, entry: e}, nil
+		e, err := decodeEntry(p)
+		return record{typ: t, entry: e}, err
 	case recordTruncate:
 		if len(p) != 8 {
 			return record{}, payloadSizeError(t, p)
@@ -142,6 +135,19 @@ func decodePayload(t recordType, p []byte) (record, error) {
 		return record{typ: t, hardState: hs, index: raft.Index(le.Uint64(p[16:])), term: raft.Term(le.Uint64(p[24:]))}, nil
 	}
 	return record{}, fmt.Errorf("unknown record type %d", t)
+}
+
+// decodeEntry decodes p, the payload of an entry record.
+func decodeEntry(p []byte) (raft.Entry, error) {
+	if len(p) < 17 {
+		return raft.Entry{}, payloadSizeError(recordEntry, p)
+	}
+	le := binary.LittleEndian
+	e := raft.Entry{Index: raft.Index(le.Uint64(p)), Term: raft.Term(le.Uint64(p[8:])), Type: raft.EntryType(p[16]), Data: bytes.Clone(p[17:])}
+	if e.Type != raft.EntryNormal && e.Type != raft.EntryNoOp {
+		return raft.Entry{}, fmt.Errorf("entry of unknown type %d", e.Type)
+	}
+	return e, nil
 }
 
 func payloadSizeError(t recordType, p []byte) error {
