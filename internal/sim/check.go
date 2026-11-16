@@ -123,9 +123,9 @@ func (c *Cluster) storeSnapshot(n *node, s raft.Snapshot, entries []raft.Entry) 
 }
 
 // checkSnapshot fails the run, and reports false, unless snapshot s, which
-// n holds, is what a state machine that applied the entries s includes
-// holds, and its last included entry is the one applied at that index
-// (State Machine Safety).
+// n holds, is what a store that applied the entries s includes holds, and
+// its last included entry is the one applied at that index (State Machine
+// Safety).
 func (c *Cluster) checkSnapshot(n *node, s raft.Snapshot) bool {
 	last := s.LastIncludedIndex
 	switch {
@@ -164,17 +164,25 @@ func (c *Cluster) checkLogMatching(n *node, e raft.Entry) {
 	c.entries[key] = info
 }
 
-// apply records that n applied e. The run fails unless e follows the last
-// entry n applied since it booted, and is the entry every other server
-// applied at that index (State Machine Safety, Figure 3).
+// apply applies e to n's store, answering the client that waits for it
+// at n, if one does. The run fails unless e follows the last entry n
+// applied since it booted, and is the entry every other server applied
+// at that index (State Machine Safety, Figure 3).
 func (c *Cluster) apply(n *node, e raft.Entry) {
 	if e.Index != n.applied+1 {
 		c.fail(fmt.Errorf("server %d applied index %d right after index %d", n.id, e.Index, n.applied))
 		return
 	}
 	n.applied = e.Index
+	if e.Type == raft.EntryNormal {
+		c.answerCommand(n, n.store.Apply(uint64(e.Index), e.Data))
+	}
 	if e.Index > raft.Index(len(c.applied)) {
 		c.applied = append(c.applied, e)
+		if e.Type == raft.EntryNormal {
+			c.reference.Apply(uint64(e.Index), e.Data)
+		}
+		c.states = append(c.states, c.reference.Snapshot())
 		return
 	}
 	if was := c.applied[e.Index-1]; !sameEntry(was, e) {

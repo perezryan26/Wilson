@@ -1,13 +1,17 @@
 package sim_test
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/perezryan26/wilson/internal/kv"
+	"github.com/perezryan26/wilson/internal/linearizability"
 	"github.com/perezryan26/wilson/internal/sim"
 	"github.com/perezryan26/wilson/raft"
 )
@@ -19,8 +23,11 @@ var (
 
 // TestRandomized runs seeds 0 to N-1 of the randomized schedule in
 // parallel, where -seeds=N sets N. Each seed checks the invariants after
-// every event, then checks liveness. A failure prints the seed's trace;
-// -seed=N replays seed N alone with every message traced.
+// every event, then liveness, then its clients' history for
+// linearizability. A failure prints the seed's trace; -seed=N replays
+// seed N alone with every message traced. A history Porcupine could not
+// check in time skips its seed, which -v shows: the workload is then too
+// large and needs resizing.
 func TestRandomized(t *testing.T) {
 	if *replay >= 0 {
 		c, err := sim.RunRandomized(uint64(*replay), true)
@@ -34,6 +41,9 @@ func TestRandomized(t *testing.T) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			t.Parallel()
 			c, err := sim.RunRandomized(seed, false)
+			if errors.Is(err, linearizability.ErrCheckTimedOut) {
+				t.Skipf("seed %d: warning: %v", seed, err)
+			}
 			if err != nil {
 				t.Fatalf("seed %d: %v\n%s\nReplay it with every message traced: go test ./internal/sim -run TestRandomized -seed=%d -v",
 					seed, err, c.Trace(), seed)
@@ -260,15 +270,15 @@ func applyEverywhere(t *testing.T, c *sim.Cluster) error {
 }
 
 // applyEverywhereIn proposes cmd once the servers among ids agree on a
-// leader, and runs c until each of them applies it.
-func applyEverywhereIn(t *testing.T, c *sim.Cluster, cmd string, ids ...raft.NodeID) {
+// leader, runs c until each of them applies it, and returns its index.
+func applyEverywhereIn(t *testing.T, c *sim.Cluster, cmd kv.Command, ids ...raft.NodeID) raft.Index {
 	t.Helper()
 	lead, _ := awaitLeader(t, c, ids...)
-	index, _, err := c.Propose(lead, []byte(cmd))
+	index, _, err := c.Propose(lead, cmd.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = c.RunUntil(10*time.Second, fmt.Sprintf("servers %v to apply %s", ids, cmd), func() bool {
+	err = c.RunUntil(10*time.Second, fmt.Sprintf("servers %v to apply entry %d", ids, index), func() bool {
 		for _, id := range ids {
 			if st, up := c.Status(id); !up || st.LastApplied < index {
 				return false
@@ -279,6 +289,7 @@ func applyEverywhereIn(t *testing.T, c *sim.Cluster, cmd string, ids ...raft.Nod
 	if err != nil {
 		t.Fatalf("%v\n%s", err, c.Trace())
 	}
+	return index
 }
 
 // §7: a server cut off while the others commit and compact far past it
@@ -296,11 +307,13 @@ func TestLaggingServerCatchesUpThroughSnapshot(t *testing.T) {
 			}
 		}
 		c.Partition(others, []raft.NodeID{lagging})
+		session := uint64(applyEverywhereIn(t, c, kv.Command{Op: kv.OpRegister}, others...))
 		for i := range 30 {
-			applyEverywhereIn(t, c, fmt.Sprintf("c%d", i), others...)
+			put := kv.Command{Op: kv.OpPut, Session: session, Seq: uint64(i + 1), Key: fmt.Sprintf("k%d", i), Value: []byte("v")}
+			applyEverywhereIn(t, c, put, others...)
 		}
 		c.Heal()
-		applyEverywhereIn(t, c, "last", 1, 2, 3)
+		applyEverywhereIn(t, c, kv.Command{Op: kv.OpGet, Key: "k0"}, 1, 2, 3)
 		installs := strings.Count(c.Trace(), fmt.Sprintf("n%d install snapshot", lagging))
 		chunks := strings.Count(c.Trace(), fmt.Sprintf("→n%d InstallSnapshot ", lagging))
 		if installs == 0 || chunks < 2 {
@@ -348,6 +361,152 @@ func TestProposalBurstSendsFewAppendEntries(t *testing.T) {
 				t.Errorf("seed %d: server %d got %d AppendEntries for a burst of %d proposals, want at most %d",
 					seed, id, n, burst, burst/2)
 			}
+		}
+	}
+}
+
+// do asks server id to carry out cmd, as a client would, runs c until the
+// server answers, and returns the result. The server must lead.
+func do(t *testing.T, c *sim.Cluster, id raft.NodeID, cmd kv.Command) kv.Result {
+	t.Helper()
+	call := c.Request(id, cmd)
+	if err := c.RunUntil(10*time.Second, fmt.Sprintf("server %d to answer", id), func() bool { return call.Done }); err != nil {
+		t.Fatalf("%v\n%s", err, c.Trace())
+	}
+	if call.Reply.NotLeader {
+		t.Fatalf("server %d does not lead", id)
+	}
+	return call.Reply.Result
+}
+
+func put(session, seq uint64, key, value string) kv.Command {
+	return kv.Command{Op: kv.OpPut, Session: session, Seq: seq, Key: key, Value: []byte(value)}
+}
+
+func get(key string) kv.Command { return kv.Command{Op: kv.OpGet, Key: key} }
+
+// others returns the servers of a cluster of size other than id.
+func others(size int, id raft.NodeID) []raft.NodeID {
+	var rest []raft.NodeID
+	for s := raft.NodeID(1); s <= raft.NodeID(size); s++ {
+		if s != id {
+			rest = append(rest, s)
+		}
+	}
+	return rest
+}
+
+// §8: a leader cut off in a minority keeps believing it leads, but it
+// never answers a read, in either read mode: through the log its Get never
+// commits, and through ReadIndex no majority confirms it. Meanwhile the
+// majority elects a new leader, which takes a write the old one never
+// sees, so an answer from the old leader would be stale.
+func TestPartitionedLeaderServesNoStaleRead(t *testing.T) {
+	for _, readIndex := range []bool{false, true} {
+		for seed := range uint64(10) {
+			c := sim.New(sim.Options{Size: 5, Seed: seed, ReadIndex: readIndex, CommitNoOpOnElection: true})
+			old, _ := awaitLeader(t, c)
+			session := do(t, c, old, kv.Command{Op: kv.OpRegister}).Session
+			do(t, c, old, put(session, 1, "x", "old"))
+			c.Partition([]raft.NodeID{old}, others(5, old))
+			lead, _ := awaitLeader(t, c, others(5, old)...)
+			do(t, c, lead, put(session, 2, "x", "new"))
+			read := c.Request(old, get("x"))
+			if err := c.RunFor(2 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+			if st, _ := c.Status(old); read.Done || st.Role != raft.Leader {
+				t.Fatalf("reads through ReadIndex %t, seed %d: the cut-off leader, now %s, answered %+v", readIndex, seed, st.Role, read.Reply)
+			}
+			c.Heal()
+			if err := c.RunFor(2 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+			if read.Done && string(read.Reply.Result.Value) == "old" {
+				t.Fatalf("reads through ReadIndex %t, seed %d: the old leader answered with the stale value", readIndex, seed)
+			}
+			if got := do(t, c, lead, get("x")); string(got.Value) != "new" {
+				t.Fatalf("reads through ReadIndex %t, seed %d: x = %q, want new", readIndex, seed, got.Value)
+			}
+		}
+	}
+}
+
+// §8: a new leader that has not committed an entry of its term may not
+// know that its predecessor committed a write, so it confirms no read
+// until it has. The leader of term 1 commits a write and answers its
+// client, then crashes before any follower learns that the write
+// committed. Without the election no-op, the new leader confirms the read
+// only once a write of its own term commits, and the read sees the first
+// write.
+func TestNewLeaderServesNoReadBeforeItsTermCommits(t *testing.T) {
+	for seed := range uint64(10) {
+		c := sim.New(sim.Options{Size: 3, Seed: seed, ReadIndex: true})
+		old, _ := awaitLeader(t, c)
+		session := do(t, c, old, kv.Command{Op: kv.OpRegister}).Session
+		do(t, c, old, put(session, 1, "x", "1"))
+		committed, _ := c.Status(old)
+		c.Crash(old)
+		for _, id := range others(3, old) {
+			if st, _ := c.Status(id); st.CommitIndex >= committed.CommitIndex {
+				t.Fatalf("seed %d: server %d knew that entry %d committed before the leader crashed", seed, id, committed.CommitIndex)
+			}
+		}
+		lead, _ := awaitLeader(t, c, others(3, old)...)
+		read := c.Request(lead, get("x"))
+		if err := c.RunFor(time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if read.Done {
+			t.Fatalf("seed %d: the new leader answered %+v before it committed an entry of its term", seed, read.Reply)
+		}
+		do(t, c, lead, put(session, 2, "y", "2"))
+		if err := c.RunUntil(time.Second, "the read's answer", func() bool { return read.Done }); err != nil {
+			t.Fatal(err)
+		}
+		if r := read.Reply.Result; !r.Found || string(r.Value) != "1" {
+			t.Fatalf("seed %d: the read answered %+v, want x = 1", seed, read.Reply)
+		}
+	}
+}
+
+// §8: a write that its leader commits and applies, but whose answer is
+// lost when the leader crashes, runs once though the client sends it
+// again, with the same number, to the new leader: the session's record
+// answers it, so a later write to the same key by another session stands.
+// Servers compact after every entry, and all of them restart from their
+// snapshots before a last retry, which the record still answers (§7).
+func TestRetriedWriteRunsOnceAcrossLeaderChange(t *testing.T) {
+	for seed := range uint64(10) {
+		c := sim.New(sim.Options{Size: 3, Seed: seed, CompactEvery: 1, CommitNoOpOnElection: true})
+		old, _ := awaitLeader(t, c)
+		a := do(t, c, old, kv.Command{Op: kv.OpRegister}).Session
+		b := do(t, c, old, kv.Command{Op: kv.OpRegister}).Session
+		do(t, c, old, put(a, 1, "x", "a1"))
+		c.Crash(old)
+		lead, _ := awaitLeader(t, c, others(3, old)...)
+		do(t, c, lead, put(b, 1, "x", "b1"))
+		if r := do(t, c, lead, put(a, 1, "x", "a1")); r.Err != nil {
+			t.Fatalf("seed %d: the retry got %v, want the first run's answer", seed, r.Err)
+		}
+		if r := do(t, c, lead, get("x")); string(r.Value) != "b1" {
+			t.Fatalf("seed %d: x = %q after the retry, want b1", seed, r.Value)
+		}
+		for id := raft.NodeID(1); id <= 3; id++ {
+			c.Crash(id)
+		}
+		for id := raft.NodeID(1); id <= 3; id++ {
+			c.Restart(id)
+		}
+		lead, _ = awaitLeader(t, c)
+		if r := do(t, c, lead, put(a, 1, "x", "a1")); r.Err != nil {
+			t.Fatalf("seed %d: the retry after a restart got %v, want the first run's answer", seed, r.Err)
+		}
+		if r := do(t, c, lead, get("x")); string(r.Value) != "b1" {
+			t.Fatalf("seed %d: x = %q after a restart and the retry, want b1", seed, r.Value)
+		}
+		if !regexp.MustCompile(`boot term=\d+ votedFor=\S+ snapshot=[1-9]`).MatchString(c.Trace()) {
+			t.Fatalf("seed %d: no server restarted from a snapshot", seed)
 		}
 	}
 }

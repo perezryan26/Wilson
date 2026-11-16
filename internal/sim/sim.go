@@ -2,7 +2,6 @@ package sim
 
 import (
 	"container/heap"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/perezryan26/wilson/internal/kv"
+	"github.com/perezryan26/wilson/internal/linearizability"
 	"github.com/perezryan26/wilson/internal/storage"
 	"github.com/perezryan26/wilson/raft"
 )
@@ -49,6 +50,12 @@ type Options struct {
 	// raft.Config.CommitNoOpOnElection: whether each new leader commits a
 	// no-op entry at the start of its term.
 	CommitNoOpOnElection bool
+	// ReadIndex makes servers serve a client's Get through ReadIndex
+	// instead of through the log (§8).
+	ReadIndex bool
+	// MaxSessions is how many client sessions each server's key-value
+	// store keeps. Zero means kv.DefaultMaxSessions.
+	MaxSessions int
 }
 
 // Cluster is a simulated raft cluster. It runs every server in one
@@ -61,11 +68,21 @@ type Cluster struct {
 	queue queue
 	seq   uint64 // events scheduled so far
 
-	commands int // commands proposed so far, for naming the next
-
 	snapshotChunkSize    int // see Options
 	maxAppendSize        int
 	commitNoOpOnElection bool
+	readIndex            bool
+	maxSessions          int
+
+	// The key-value service's clients, the history of their operations,
+	// and the IDs servers give requests. With idleClients set, clients
+	// send nothing until pauseUntil after each election past seenTerm.
+	clients     []*client
+	history     *linearizability.Recorder
+	requests    uint64
+	idleClients bool
+	seenTerm    raft.Term
+	pauseUntil  time.Duration
 
 	nodes   []*node // nodes[i] is server i+1
 	net     Network
@@ -76,19 +93,28 @@ type Cluster struct {
 	entries   map[logKey]entryInfo      // every entry ever stored
 	committed []commitment              // entries known committed, from index 1
 	applied   []raft.Entry              // entries applied, from index 1
+	reference *kv.Store                 // a store that applied every entry in applied
+	states    [][]byte                  // states[i] is reference's snapshot after entry i+1
 	err       error                     // the first violation, which ends the run
 
 	trace         strings.Builder
 	traceMessages bool
 }
 
-// node is one simulated server: a core and its file storage while it
-// runs, and a disk that survives its crashes, losing what was not synced.
+// node is one simulated server: a core, its file storage, and its
+// key-value store while it runs, and a disk that survives its crashes,
+// losing what was not synced.
 type node struct {
 	id      raft.NodeID
 	core    *raft.Node           // nil while the server is down
 	storage *storage.FileStorage // the WAL on disk; nil while the server is down
+	store   *kv.Store            // the state machine
 	disk    *storage.FaultFS
+	// The clients' requests the server is working on: commands it
+	// proposed, by request ID, until they apply, and reads it asked its
+	// core to confirm, by read ID. A crash loses them.
+	waiting map[uint64]request
+	reads   map[uint64]request
 	period  time.Duration // this server's tick interval
 	// compactEvery is the server's Options.CompactEvery. The randomized
 	// schedule may give each server its own.
@@ -110,6 +136,9 @@ type node struct {
 // New returns a cluster of opts.Size servers, all up and connected, at
 // virtual time 0.
 func New(opts Options) *Cluster {
+	if opts.MaxSessions == 0 {
+		opts.MaxSessions = kv.DefaultMaxSessions
+	}
 	c := &Cluster{
 		rng:     rand.New(rand.NewPCG(opts.Seed, 0)),
 		net:     DefaultNetwork(),
@@ -120,8 +149,12 @@ func New(opts Options) *Cluster {
 		snapshotChunkSize:    opts.SnapshotChunkSize,
 		maxAppendSize:        opts.MaxAppendSize,
 		commitNoOpOnElection: opts.CommitNoOpOnElection,
+		readIndex:            opts.ReadIndex,
+		maxSessions:          opts.MaxSessions,
+		reference:            kv.NewStore(opts.MaxSessions),
 		traceMessages:        opts.TraceMessages,
 	}
+	c.history = linearizability.NewRecorder(func() int64 { return int64(c.now) })
 	_, tick := raft.DefaultConfig()
 	for i := range opts.Size {
 		// Servers' clocks drift apart: each ticks up to 20% fast or slow.
@@ -185,10 +218,10 @@ func (c *Cluster) Propose(id raft.NodeID, cmd []byte) (raft.Index, raft.Term, er
 	}
 	index, term, err := n.core.Propose(cmd)
 	if err != nil {
-		c.tracef("%s propose %s: %v", name(id), cmd, err)
+		c.tracef("%s propose %s: %v", name(id), commandName(cmd), err)
 		return 0, 0, err
 	}
-	c.tracef("%s propose %s: index=%d term=%d", name(id), cmd, index, term)
+	c.tracef("%s propose %s: index=%d term=%d", name(id), commandName(cmd), index, term)
 	c.handleReady(n)
 	c.observe()
 	if n.core == nil {
@@ -315,8 +348,9 @@ func (c *Cluster) boot(n *node) {
 	}
 	c.checkRestored(n, restored.HardState)
 	n.snapshot, n.applied, n.log = 0, 0, restored.Entries
+	n.store, n.waiting, n.reads = kv.NewStore(c.maxSessions), map[uint64]request{}, map[uint64]request{}
 	if s := restored.Snapshot; s != nil {
-		if !c.checkSnapshot(n, *s) {
+		if !c.checkSnapshot(n, *s) || !c.restore(n, *s) {
 			return
 		}
 		n.snapshot, n.applied = s.LastIncludedIndex, s.LastIncludedIndex
@@ -389,22 +423,35 @@ func (c *Cluster) handleReady(n *node) {
 		c.send(m)
 	}
 	if s := rd.Snapshot; s != nil && s.LastIncludedIndex > n.applied {
+		if !c.restore(n, *s) {
+			return
+		}
 		n.applied = s.LastIncludedIndex
 		c.tracef("%s install snapshot lastIncludedIndex=%d lastIncludedTerm=%d", name(n.id), s.LastIncludedIndex, s.LastIncludedTerm)
 	}
 	for _, e := range rd.CommittedEntries {
 		c.apply(n, e)
 	}
+	c.answerReads(n, rd.ReadStates)
 	c.maybeCompact(n)
 }
 
-// maybeCompact has n's service snapshot its state machine, once it has
-// applied compactEvery entries past its latest snapshot (§7).
+// restore resets n's store from snapshot s, and reports whether it could.
+func (c *Cluster) restore(n *node, s raft.Snapshot) bool {
+	if err := n.store.Restore(s.Data); err != nil {
+		c.fail(fmt.Errorf("server %d: %w", n.id, err))
+		return false
+	}
+	return true
+}
+
+// maybeCompact has n's service snapshot its store, once it has applied
+// compactEvery entries past its latest snapshot (§7).
 func (c *Cluster) maybeCompact(n *node) {
 	if n.compactEvery == 0 || n.core == nil || n.applied < n.snapshot+raft.Index(n.compactEvery) {
 		return
 	}
-	if err := n.core.Compact(n.applied, c.stateAt(n.applied)); err != nil {
+	if err := n.core.Compact(n.applied, n.store.Snapshot()); err != nil {
 		c.fail(fmt.Errorf("server %d: %w", n.id, err))
 		return
 	}
@@ -412,21 +459,10 @@ func (c *Cluster) maybeCompact(n *node) {
 	c.handleReady(n)
 }
 
-// stateAt returns the state of a state machine that has applied the
-// first index entries: the JSON list of their commands. By State Machine
-// Safety, every server's state machine holds exactly this once it has
-// applied index entries.
-func (c *Cluster) stateAt(index raft.Index) []byte {
-	commands := make([]string, index)
-	for i, e := range c.applied[:index] {
-		commands[i] = string(e.Data)
-	}
-	data, err := json.Marshal(commands)
-	if err != nil {
-		panic("sim: encoding a list of strings failed: " + err.Error())
-	}
-	return data
-}
+// stateAt returns the state of a store that has applied the first index
+// entries. By State Machine Safety, every server's store holds exactly
+// this once it has applied index entries.
+func (c *Cluster) stateAt(index raft.Index) []byte { return c.states[index-1] }
 
 // observe traces every change of role, term, or leader, and checks the
 // invariants that must hold at every instant. It runs after every event.
