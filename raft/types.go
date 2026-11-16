@@ -15,11 +15,19 @@ type NodeID uint64
 // None is the NodeID that names no server, as in a votedFor that is null.
 const None NodeID = 0
 
+// EntryType says what a log entry holds.
+type EntryType uint8
+
+// EntryNormal is the type of an entry that holds a command for the state
+// machine.
+const EntryNormal EntryType = 0
+
 // Entry is one log entry: a command for the state machine and the term in
 // which the leader received it (Figure 2).
 type Entry struct {
 	Index Index
 	Term  Term
+	Type  EntryType // what Data holds
 	Data  []byte
 }
 

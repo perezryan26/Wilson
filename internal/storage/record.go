@@ -27,8 +27,9 @@ type recordType uint8
 const (
 	// recordHardState holds currentTerm u64 and votedFor u64.
 	recordHardState recordType = 1
-	// recordEntry holds one log entry: index u64, term u64, an entry type
-	// byte, and the command, which runs to the end of the record.
+	// recordEntry holds one log entry: index u64, term u64, the entry's
+	// type as a byte, and the command, which runs to the end of the
+	// record.
 	recordEntry recordType = 2
 	// recordTruncate holds index u64: every entry from index on is
 	// discarded, because the entries that follow overwrite them.
@@ -40,11 +41,6 @@ const (
 	// after the snapshot.
 	recordSnapshot recordType = 4
 )
-
-// entryNormal is the entry type byte of every entry record. Only normal
-// entries exist so far; the byte is reserved so that the election no-op
-// and configuration entries will need no new record layout.
-const entryNormal byte = 0
 
 // record is one WAL record. Which fields hold its payload depends on typ.
 type record struct {
@@ -68,7 +64,7 @@ func appendRecord(buf []byte, r record) []byte {
 	case recordEntry:
 		buf = le.AppendUint64(buf, uint64(r.entry.Index))
 		buf = le.AppendUint64(buf, uint64(r.entry.Term))
-		buf = append(buf, entryNormal)
+		buf = append(buf, byte(r.entry.Type))
 		buf = append(buf, r.entry.Data...)
 	case recordTruncate:
 		buf = le.AppendUint64(buf, uint64(r.index))
@@ -127,10 +123,11 @@ func decodePayload(t recordType, p []byte) (record, error) {
 		if len(p) < 17 {
 			return record{}, payloadSizeError(t, p)
 		}
-		if p[16] != entryNormal {
-			return record{}, fmt.Errorf("entry of unknown type %d", p[16])
+		typ := raft.EntryType(p[16])
+		if typ != raft.EntryNormal {
+			return record{}, fmt.Errorf("entry of unknown type %d", typ)
 		}
-		e := raft.Entry{Index: raft.Index(le.Uint64(p)), Term: raft.Term(le.Uint64(p[8:])), Data: bytes.Clone(p[17:])}
+		e := raft.Entry{Index: raft.Index(le.Uint64(p)), Term: raft.Term(le.Uint64(p[8:])), Type: typ, Data: bytes.Clone(p[17:])}
 		return record{typ: t, entry: e}, nil
 	case recordTruncate:
 		if len(p) != 8 {

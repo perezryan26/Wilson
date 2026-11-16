@@ -28,7 +28,8 @@ func sampleRecords() []record {
 
 func sameRecord(a, b record) bool {
 	return a.typ == b.typ && a.hardState == b.hardState && a.index == b.index && a.term == b.term &&
-		a.entry.Index == b.entry.Index && a.entry.Term == b.entry.Term && bytes.Equal(a.entry.Data, b.entry.Data)
+		a.entry.Index == b.entry.Index && a.entry.Term == b.entry.Term && a.entry.Type == b.entry.Type &&
+		bytes.Equal(a.entry.Data, b.entry.Data)
 }
 
 // frame returns body as a record with a correct length and checksum, so a
@@ -93,11 +94,11 @@ func TestFlippedBitIsCaught(t *testing.T) {
 // damaged, not incomplete: an empty record, an unknown type, a payload of
 // the wrong size, or an entry of an unknown entry type.
 func TestMalformedRecordIsDamaged(t *testing.T) {
-	entry := func(entryType byte) []byte {
+	entry := func(entryType raft.EntryType) []byte {
 		b := append([]byte{byte(recordEntry)}, make([]byte, 16)...)
-		return append(b, entryType, 'x')
+		return append(b, byte(entryType), 'x')
 	}
-	if _, _, err := decodeRecord(frame(entry(entryNormal))); err != nil {
+	if _, _, err := decodeRecord(frame(entry(raft.EntryNormal))); err != nil {
 		t.Fatalf("a well-formed entry failed to decode: %v", err)
 	}
 	cases := map[string][]byte{

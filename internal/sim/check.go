@@ -71,6 +71,7 @@ type logKey struct {
 
 // entryInfo is what every stored copy of an entry must agree on.
 type entryInfo struct {
+	typ      raft.EntryType
 	command  string
 	prevTerm raft.Term // the term of the entry before it
 }
@@ -142,11 +143,12 @@ func (c *Cluster) checkSnapshot(n *node, s raft.Snapshot) bool {
 }
 
 func sameEntry(a, b raft.Entry) bool {
-	return a.Index == b.Index && a.Term == b.Term && bytes.Equal(a.Data, b.Data)
+	return a.Index == b.Index && a.Term == b.Term && a.Type == b.Type && bytes.Equal(a.Data, b.Data)
 }
 
-// checkLogMatching fails the run if e differs, in command or in the term of
-// the entry before it, from any entry ever stored with e's index and term.
+// checkLogMatching fails the run if e differs, in type, command, or the
+// term of the entry before it, from any entry ever stored with e's index
+// and term.
 // With the term before every entry pinned, two logs that share an entry's
 // index and term share every entry up to it: Log Matching (Figure 3).
 func (c *Cluster) checkLogMatching(n *node, e raft.Entry) {
@@ -154,7 +156,7 @@ func (c *Cluster) checkLogMatching(n *node, e raft.Entry) {
 	if e.Index > 1 {
 		prevTerm = n.log[e.Index-2].Term
 	}
-	key, info := logKey{e.Index, e.Term}, entryInfo{string(e.Data), prevTerm}
+	key, info := logKey{e.Index, e.Term}, entryInfo{e.Type, string(e.Data), prevTerm}
 	if seen, ok := c.entries[key]; ok && seen != info {
 		c.fail(fmt.Errorf("server %d stored a different entry at index %d of term %d (Log Matching)", n.id, e.Index, e.Term))
 		return
@@ -175,7 +177,7 @@ func (c *Cluster) apply(n *node, e raft.Entry) {
 		c.applied = append(c.applied, e)
 		return
 	}
-	if was := c.applied[e.Index-1]; was.Term != e.Term || string(was.Data) != string(e.Data) {
+	if was := c.applied[e.Index-1]; !sameEntry(was, e) {
 		c.fail(fmt.Errorf("server %d applied a different entry at index %d (State Machine Safety)", n.id, e.Index))
 	}
 }
