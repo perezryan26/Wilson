@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/perezryan26/wilson/internal/kv"
+	"github.com/perezryan26/wilson/internal/kvserver"
 	"github.com/perezryan26/wilson/internal/storage"
 	"github.com/perezryan26/wilson/internal/transport"
 	"github.com/perezryan26/wilson/node"
@@ -27,12 +29,13 @@ import (
 
 // options are kvnode's settings, from its flags.
 type options struct {
-	id           raft.NodeID
-	peers        map[raft.NodeID]string // every server's address, this one's included
-	listen       string
-	dataDir      string
-	preset       string
-	compactEvery int
+	id             raft.NodeID
+	peers          map[raft.NodeID]string // every server's address, this one's included
+	listen         string
+	dataDir        string
+	preset         string
+	compactEvery   int
+	readThroughLog bool
 }
 
 func main() {
@@ -73,30 +76,44 @@ func parseFlags(args []string) (options, error) {
 	dataDir := fset.String("data", "", "the `directory` for this server's log and snapshots; created if missing, but its parent must exist")
 	preset := fset.String("preset", "default", "the timing `preset`: default (10 ms ticks, 50 ms heartbeats, 300-600 ms election timeouts)")
 	compactEvery := fset.Int("compact-every", 1000, "snapshot the state machine and compact the log after this many `entries`; 0 never does")
+	reads := fset.String("reads", "index", "how to serve a read: `index` confirms leadership with a round of heartbeats (ReadIndex), log runs it through the log")
 	if err := fset.Parse(args); err != nil {
 		return options{}, err
+	}
+	if fset.NArg() > 0 {
+		return options{}, fmt.Errorf("unexpected arguments %q", fset.Args())
 	}
 	o := options{id: raft.NodeID(*id), listen: *listen, dataDir: *dataDir, preset: *preset, compactEvery: *compactEvery}
 	var err error
 	if o.peers, err = parsePeers(*peers); err != nil {
 		return options{}, err
 	}
-	switch {
-	case fset.NArg() > 0:
-		return options{}, fmt.Errorf("unexpected arguments %q", fset.Args())
-	case o.peers[o.id] == "":
-		return options{}, fmt.Errorf("-id %d is not one of the servers in -peers", o.id)
-	case o.dataDir == "":
-		return options{}, errors.New("-data is required")
-	case o.preset != "default":
-		return options{}, fmt.Errorf("-preset %q is not a preset; the one preset is default", o.preset)
-	case o.compactEvery < 0:
-		return options{}, fmt.Errorf("-compact-every %d is negative", o.compactEvery)
+	if err := o.check(*reads); err != nil {
+		return options{}, err
 	}
+	o.readThroughLog = *reads == "log"
 	if o.listen == "" {
 		o.listen = o.peers[o.id]
 	}
 	return o, nil
+}
+
+// check returns an error naming the first of o's flags, or -reads, that is
+// missing or wrong.
+func (o options) check(reads string) error {
+	switch {
+	case o.peers[o.id] == "":
+		return fmt.Errorf("-id %d is not one of the servers in -peers", o.id)
+	case o.dataDir == "":
+		return errors.New("-data is required")
+	case o.preset != "default":
+		return fmt.Errorf("-preset %q is not a preset; the one preset is default", o.preset)
+	case o.compactEvery < 0:
+		return fmt.Errorf("-compact-every %d is negative", o.compactEvery)
+	case reads != "index" && reads != "log":
+		return fmt.Errorf("-reads %q is neither index nor log", reads)
+	}
+	return nil
 }
 
 // parsePeers parses -peers: comma-separated id=host:port pairs, with IDs
@@ -139,15 +156,16 @@ func run(ctx context.Context, o options, logger *slog.Logger, running *atomic.Po
 	for id := range o.peers {
 		cfg.Peers = append(cfg.Peers, id)
 	}
-	sm := &commandLog{}
+	sm := kvserver.NewStateMachine(kv.NewStore(kv.DefaultMaxSessions))
 	n, err := node.Start(node.Config{Raft: cfg, Tick: tick, CompactEvery: o.compactEvery, Logger: logger}, st, tr, sm)
 	if err != nil {
 		return err
 	}
 	running.Store(n)
+	api := kvserver.New(n, sm, kvserver.Options{ID: o.id, Peers: o.peers, ReadThroughLog: o.readThroughLog, MaxValue: cfg.MaxAppendSize})
 	mux := http.NewServeMux()
 	mux.Handle(transport.MessagePath, tr.Handler(n.Step))
-	debugAPI{node: n, sm: sm, maxCommand: cfg.MaxAppendSize}.register(mux)
+	mux.Handle("/v1/", api.Handler())
 	return serve(ctx, o.listen, n, mux, logger)
 }
 

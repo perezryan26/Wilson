@@ -39,9 +39,14 @@ for i in $(seq 1 "$size"); do
 	pids="$pids $!"
 done
 
+servers=""
+for i in $(seq 1 "$size"); do
+	servers="$servers${servers:+,}127.0.0.1:$((base + i))"
+done
 cat <<EOF
 A cluster of $size servers, with data in $data. Ctrl-C stops them all.
-  status:   curl -s 127.0.0.1:$((base + 1))/debug/state
-  propose:  curl -s -d hello 127.0.0.1:$((base + 1))/debug/propose   (at the leader)
+  status:  go run ./cmd/kvctl -servers $servers status
+  write:   go run ./cmd/kvctl -servers $servers put greeting hello
+  read:    go run ./cmd/kvctl -servers $servers get greeting
 EOF
 wait

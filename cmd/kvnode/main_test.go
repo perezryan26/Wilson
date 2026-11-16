@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/perezryan26/wilson/raft"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -32,6 +30,7 @@ func TestParseFlags(t *testing.T) {
 		{"no data directory", []string{"-id", "1", "-peers", peers}, "-data"},
 		{"unknown preset", []string{"-id", "1", "-peers", peers, "-data", "d", "-preset", "fast"}, "-preset"},
 		{"negative compaction threshold", []string{"-id", "1", "-peers", peers, "-data", "d", "-compact-every", "-1"}, "-compact-every"},
+		{"unknown read mode", []string{"-id", "1", "-peers", peers, "-data", "d", "-reads", "lease"}, "-reads"},
 		{"extra argument", []string{"-id", "1", "-peers", peers, "-data", "d", "now"}, "unexpected"},
 	}
 	for _, tt := range tests {
@@ -40,6 +39,19 @@ func TestParseFlags(t *testing.T) {
 				t.Errorf("error = %v, want one about %s", err, tt.want)
 			}
 		})
+	}
+}
+
+// Reads go through ReadIndex unless -reads log sends them through the log.
+func TestParseFlagsReads(t *testing.T) {
+	for reads, want := range map[string]bool{"": false, "index": false, "log": true} {
+		args := []string{"-id", "1", "-peers", "1=127.0.0.1:8001", "-data", "d"}
+		if reads != "" {
+			args = append(args, "-reads", reads)
+		}
+		if o, err := parseFlags(args); err != nil || o.readThroughLog != want {
+			t.Errorf("-reads %q: options = %+v, %v, want readThroughLog %t", reads, o, err, want)
+		}
 	}
 }
 
@@ -58,27 +70,5 @@ func TestCreateDataDir(t *testing.T) {
 	}
 	if err := createDataDir(filepath.Join(t.TempDir(), "missing", "n1")); err == nil {
 		t.Error("created a data directory whose parent is missing")
-	}
-}
-
-// The state machine kvnode replicates until the key-value store exists
-// restores exactly what it snapshotted.
-func TestCommandLogRestoresSnapshot(t *testing.T) {
-	var l commandLog
-	l.Apply(raft.Entry{Index: 1, Data: []byte("a")})
-	l.Apply(raft.Entry{Index: 2, Data: []byte("b")})
-	data, err := l.Snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var restored commandLog
-	if err := restored.Restore(data); err != nil {
-		t.Fatal(err)
-	}
-	if got := restored.list(); strings.Join(got, ",") != "a,b" {
-		t.Errorf("restored %v, want [a b]", got)
-	}
-	if err := restored.Restore([]byte("not json")); err == nil {
-		t.Error("restored a snapshot that is not JSON")
 	}
 }

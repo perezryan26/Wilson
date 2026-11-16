@@ -1,23 +1,21 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
+	"context"
 	"fmt"
 	"math/rand/v2"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/perezryan26/wilson/client"
 	"github.com/perezryan26/wilson/raft"
 )
 
@@ -79,13 +77,14 @@ func raceEnabled() bool {
 // test's cleanup kills every process still running, before the temporary
 // directory is removed, whether the test passed or failed.
 type testCluster struct {
-	t      *testing.T
-	bin    string
-	dir    string
-	addrs  map[raft.NodeID]string
-	peers  string                    // the -peers flag
-	procs  map[raft.NodeID]*exec.Cmd // the running processes
-	client *http.Client
+	t       *testing.T
+	bin     string
+	dir     string
+	addrs   map[raft.NodeID]string
+	peers   string                    // the -peers flag
+	procs   map[raft.NodeID]*exec.Cmd // the running processes
+	client  *client.Client
+	written map[string]string // every acknowledged write
 	// deadline comes well before go test's -timeout, which panics without
 	// running cleanups and would leave the servers running: every wait
 	// gives up by then, so the test fails and its cleanup kills them.
@@ -96,12 +95,12 @@ type testCluster struct {
 // four entries.
 func startCluster(t *testing.T, size int) *testCluster {
 	c := &testCluster{
-		t:      t,
-		bin:    buildKvnode(t),
-		dir:    t.TempDir(),
-		addrs:  map[raft.NodeID]string{},
-		procs:  map[raft.NodeID]*exec.Cmd{},
-		client: &http.Client{Timeout: 2 * time.Second},
+		t:       t,
+		bin:     buildKvnode(t),
+		dir:     t.TempDir(),
+		addrs:   map[raft.NodeID]string{},
+		procs:   map[raft.NodeID]*exec.Cmd{},
+		written: map[string]string{},
 	}
 	if d, ok := t.Deadline(); ok {
 		c.deadline = d.Add(-30 * time.Second)
@@ -113,9 +112,12 @@ func startCluster(t *testing.T, size int) *testCluster {
 		peers = append(peers, fmt.Sprintf("%d=%s", id+1, c.addrs[id+1]))
 	}
 	c.peers = strings.Join(peers, ",")
+	var servers []string
 	for id := range raft.NodeID(size) {
+		servers = append(servers, c.addrs[id+1])
 		c.start(id + 1)
 	}
+	c.client = client.New(servers, client.Options{})
 	return c
 }
 
@@ -208,7 +210,9 @@ func (c *testCluster) cleanup() {
 	for id := range c.procs {
 		c.kill(id)
 	}
-	c.client.CloseIdleConnections()
+	if c.client != nil {
+		c.client.Close()
+	}
 	for id := range raft.NodeID(len(c.addrs)) {
 		out, err := os.ReadFile(c.logPath(id + 1))
 		if err != nil {
@@ -224,37 +228,11 @@ func (c *testCluster) cleanup() {
 	}
 }
 
-// state asks server id for its status and the commands it applied.
-func (c *testCluster) state(id raft.NodeID) (state, error) {
-	var s state
-	resp, err := c.client.Get("http://" + c.addrs[id] + "/debug/state")
-	err = decodeAnswer(resp, err, &s)
-	return s, err
-}
-
-// propose proposes cmd at server id and returns the new entry's index
-// and term, or an error if id did not accept it.
-func (c *testCluster) propose(id raft.NodeID, cmd string) (raft.Index, raft.Term, error) {
-	var r struct {
-		Index raft.Index `json:"index"`
-		Term  raft.Term  `json:"term"`
-	}
-	resp, err := c.client.Post("http://"+c.addrs[id]+"/debug/propose", "text/plain", strings.NewReader(cmd))
-	err = decodeAnswer(resp, err, &r)
-	return r.Index, r.Term, err
-}
-
-// decodeAnswer decodes the JSON in resp into v, or returns err, or an
-// error if resp is not 200 OK.
-func decodeAnswer(resp *http.Response, err error, v any) error {
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return errors.New(resp.Status)
-	}
-	return json.NewDecoder(resp.Body).Decode(v)
+// status asks server id for its status.
+func (c *testCluster) status(id raft.NodeID) (client.Status, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return c.client.Status(ctx, c.addrs[id])
 }
 
 // waitFor fails the test unless done reports true within twenty seconds,
@@ -279,115 +257,90 @@ func (c *testCluster) within(d time.Duration) time.Time {
 }
 
 // leader waits until every running server follows one running leader in
-// one term, and returns the leader and the term.
-func (c *testCluster) leader() (raft.NodeID, raft.Term) {
+// one term, and returns the leader, the term, and its status.
+func (c *testCluster) leader() (raft.NodeID, raft.Term, client.Status) {
 	c.t.Helper()
 	var lead raft.NodeID
 	var term raft.Term
+	var st client.Status
 	c.waitFor("an agreed leader", func() bool {
 		lead, term = raft.None, 0
 		for id := range c.procs {
-			s, err := c.state(id)
-			if err != nil || s.Leader == raft.None || lead != raft.None && (s.Leader != lead || s.Term != term) {
+			s, err := c.status(id)
+			if err != nil || s.Leader == 0 || lead != raft.None && (raft.NodeID(s.Leader) != lead || raft.Term(s.Term) != term) {
 				return false
 			}
-			lead, term = s.Leader, s.Term
+			lead, term = raft.NodeID(s.Leader), raft.Term(s.Term)
+			if id == lead {
+				st = s
+			}
 		}
-		return c.procs[lead] != nil
+		return c.procs[lead] != nil && st.Role == raft.Leader.String()
 	})
-	return lead, term
+	return lead, term, st
 }
 
-// commit proposes cmd at the leader and waits until the leader reports it
-// committed in the term it was proposed in. If leadership changes first,
-// it proposes cmd again. It returns the index of the entry it saw commit.
-func (c *testCluster) commit(cmd string) raft.Index {
+// put writes key=value through the client, which finds the leader and
+// retries, and records it as acknowledged.
+func (c *testCluster) put(key, value string) {
 	c.t.Helper()
-	var index raft.Index
-	c.waitFor("a leader to commit "+cmd, func() bool {
-		lead, _ := c.leader()
-		i, term, err := c.propose(lead, cmd)
-		if err != nil {
-			return false
-		}
-		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
-			s, err := c.state(lead)
-			if err != nil || s.Role != raft.Leader.String() || s.Term != term {
-				return false
-			}
-			if s.CommitIndex >= i {
-				index = i
-				return true
-			}
-		}
-		return false
-	})
-	return index
+	ctx, cancel := context.WithDeadline(context.Background(), c.within(20*time.Second))
+	defer cancel()
+	if err := c.client.Put(ctx, key, []byte(value)); err != nil {
+		c.t.Fatalf("Put(%s): %v", key, err)
+	}
+	c.written[key] = value
 }
 
-// checkCommitted waits until every running server has applied the last
-// of committed, then checks that each applied every committed command at
-// its index and that all of them applied the same commands.
-func (c *testCluster) checkCommitted(committed map[raft.Index]string) {
+// checkWritten reads every acknowledged write back through the client.
+func (c *testCluster) checkWritten() {
 	c.t.Helper()
-	last := slices.Max(slices.Collect(func(yield func(raft.Index) bool) {
-		for i := range committed {
-			if !yield(i) {
-				return
-			}
-		}
-	}))
-	applied := map[raft.NodeID][]string{}
-	c.waitFor(fmt.Sprintf("every server to apply index %d", last), func() bool {
-		for id := range c.procs {
-			s, err := c.state(id)
-			if err != nil || s.LastApplied < last {
-				return false
-			}
-			applied[id] = s.Commands
-		}
-		return true
-	})
-	for id, commands := range applied {
-		for index, cmd := range committed {
-			if commands[index-1] != cmd {
-				c.t.Errorf("server %d applied %q at index %d, where %q committed", id, commands[index-1], index, cmd)
-			}
-		}
-		if other := applied[1]; !slices.Equal(commands[:last], other[:last]) {
-			c.t.Errorf("servers 1 and %d applied different commands:\n%v\n%v", id, other[:last], commands[:last])
+	ctx, cancel := context.WithDeadline(context.Background(), c.within(20*time.Second))
+	defer cancel()
+	for key, want := range c.written {
+		got, found, err := c.client.Get(ctx, key)
+		if err != nil || !found || string(got) != want {
+			c.t.Errorf("Get(%s) = %q, %t, %v, want %q", key, got, found, err, want)
 		}
 	}
 }
 
-// A cluster of three kvnode processes elects a leader and commits
-// commands. Killed with SIGKILL, the leader is replaced by one of the
-// other two, which go on committing. Restarted from its disk, the old
-// leader catches up through the new leader's snapshot, sent over HTTP,
-// since every server compacts its log every four entries. Every committed
-// command is applied at its index on every server, and every server shuts
-// down cleanly on SIGTERM.
+// A cluster of three kvnode processes elects a leader and takes writes
+// through the client library. Killed with SIGKILL, the leader is replaced
+// by one of the other two, which go on taking writes. Restarted from its
+// disk, the old leader catches up through the new leader's snapshot, sent
+// over HTTP, since every server compacts its log every four entries.
+// Every acknowledged write reads back, and again after the whole cluster
+// shuts down cleanly on SIGTERM and restarts from its disks, when each
+// new leader's no-op lets it serve them at once.
 func TestIntegrationKillLeader(t *testing.T) {
 	c := startCluster(t, 3)
-	committed := map[raft.Index]string{}
 	for i := range 6 {
-		cmd := fmt.Sprintf("before-%d", i)
-		committed[c.commit(cmd)] = cmd
+		c.put(fmt.Sprintf("before-%d", i), fmt.Sprint(i))
 	}
-	old, oldTerm := c.leader()
+	old, oldTerm, _ := c.leader()
 	c.kill(old)
-	if lead, term := c.leader(); lead == old || term <= oldTerm {
+	if lead, term, _ := c.leader(); lead == old || term <= oldTerm {
 		t.Fatalf("server %d leads term %d after server %d, leader of term %d, was killed", lead, term, old, oldTerm)
 	}
 	for i := range 6 {
-		cmd := fmt.Sprintf("after-%d", i)
-		committed[c.commit(cmd)] = cmd
+		c.put(fmt.Sprintf("after-%d", i), fmt.Sprint(i))
 	}
 	c.start(old)
-	c.checkCommitted(committed)
+	_, _, lead := c.leader()
+	c.waitFor(fmt.Sprintf("server %d to apply index %d", old, lead.CommitIndex), func() bool {
+		st, err := c.status(old)
+		return err == nil && st.LastApplied >= lead.CommitIndex
+	})
 	if !c.logged(old, "installed the leader's snapshot") {
 		t.Errorf("server %d logged no snapshot install, with its node, term, and role", old)
 	}
+	c.checkWritten()
+	c.stopAll()
+	for id := range raft.NodeID(3) {
+		c.start(id + 1)
+	}
+	c.checkWritten()
 	c.stopAll()
 }
 
