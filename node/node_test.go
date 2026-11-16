@@ -75,6 +75,7 @@ type cluster struct {
 	nodes  map[raft.NodeID]*node.Node // the running nodes
 	stores map[raft.NodeID]*storage.Memory
 	sms    map[raft.NodeID]*commands
+	cut    map[raft.NodeID]bool // servers the network cuts off from the rest
 }
 
 // newCluster starts a cluster of servers 1 to size, ticking every
@@ -86,6 +87,7 @@ func newCluster(t *testing.T, size, compactEvery int) *cluster {
 		nodes:  map[raft.NodeID]*node.Node{},
 		stores: map[raft.NodeID]*storage.Memory{},
 		sms:    map[raft.NodeID]*commands{},
+		cut:    map[raft.NodeID]bool{},
 	}
 	for id := range raft.NodeID(size) {
 		c.stores[id+1] = &storage.Memory{}
@@ -138,11 +140,23 @@ func (c *cluster) node(id raft.NodeID) *node.Node {
 	return c.nodes[id]
 }
 
-// network is the cluster's transport: it delivers each message at once.
+// setCut cuts server id off from the rest of the cluster, or reconnects
+// it.
+func (c *cluster) setCut(id raft.NodeID, cut bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cut[id] = cut
+}
+
+// network is the cluster's transport: it delivers each message at once,
+// unless its sender or receiver is cut off.
 type network struct{ c *cluster }
 
 func (nw network) Send(m raft.Message) {
-	if n := nw.c.node(m.To); n != nil {
+	nw.c.mu.Lock()
+	cut := nw.c.cut[m.From] || nw.c.cut[m.To]
+	nw.c.mu.Unlock()
+	if n := nw.c.node(m.To); n != nil && !cut {
 		n.Step(m)
 	}
 }
@@ -354,6 +368,103 @@ func TestStopDuringTraffic(t *testing.T) {
 		c.stop(id + 1)
 	}
 	wg.Wait()
+}
+
+// tryRead asks whichever server leads to confirm a read, trying again at
+// the next leader if that one stops leading first, and fails if a leader
+// takes two seconds to answer. It is safe to call from any goroutine.
+func (c *cluster) tryRead() error {
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		for id := range raft.NodeID(c.size) {
+			n := c.node(id + 1)
+			if n == nil || n.Status().Role != raft.Leader {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := n.ReadIndex(ctx)
+			cancel()
+			if err == nil || !errors.Is(err, raft.ErrNotLeader) && !errors.Is(err, node.ErrStopped) {
+				return err
+			}
+		}
+	}
+	return errors.New("no server confirmed a read within ten seconds")
+}
+
+// §8: the leader confirms reads, many at once while proposals flow, and
+// a follower refuses them.
+func TestReadIndexAtLeader(t *testing.T) {
+	leaktest.Check(t)
+	c := newCluster(t, 3, 0)
+	c.propose("x")
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for g := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 10 {
+				if g == 0 {
+					_, _ = c.tryPropose(fmt.Sprintf("p%d", i))
+				}
+				errs <- c.tryRead()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	follower := c.leader()%3 + 1
+	if err := c.node(follower).ReadIndex(context.Background()); !errors.Is(err, raft.ErrNotLeader) {
+		t.Errorf("ReadIndex at a follower: error %v, want raft.ErrNotLeader", err)
+	}
+}
+
+// §8: a leader cut off from the rest of its cluster never confirms a
+// read, though it still believes it leads, because no majority answers
+// its heartbeats; the others may have elected a new leader and taken
+// writes it has not seen. Once it hears of the new term and steps down,
+// its waiting reads fail with raft.ErrNotLeader.
+func TestCutOffLeaderServesNoRead(t *testing.T) {
+	leaktest.Check(t)
+	c := newCluster(t, 3, 0)
+	c.propose("before")
+	old := c.leader()
+	c.setCut(old, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := c.node(old).ReadIndex(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadIndex at a cut-off leader: error %v, want a timeout", err)
+	}
+	waiting := make(chan error, 1)
+	go func() { waiting <- c.node(old).ReadIndex(context.Background()) }()
+	waitFor(t, "another server to lead", func() bool {
+		for id := range raft.NodeID(3) {
+			if st := c.node(id + 1).Status(); id+1 != old && st.Role == raft.Leader {
+				return true
+			}
+		}
+		return false
+	})
+	select {
+	case err := <-waiting:
+		t.Fatalf("ReadIndex at the old leader returned %v while it was cut off", err)
+	default:
+	}
+	c.setCut(old, false)
+	c.propose("after")
+	select {
+	case err := <-waiting:
+		if !errors.Is(err, raft.ErrNotLeader) {
+			t.Errorf("ReadIndex waiting at the old leader: error %v, want raft.ErrNotLeader once it steps down", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReadIndex at the old leader still waits after it stepped down")
+	}
 }
 
 // events records, in order, what a node did through its storage,

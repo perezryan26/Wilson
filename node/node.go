@@ -76,12 +76,25 @@ type Node struct {
 
 	inbox     chan raft.Message
 	proposals chan proposal
-	stop      chan struct{} // closed by Stop
+	reads     chan chan<- error // ReadIndex's requests, each with where its answer goes
+	stop      chan struct{}     // closed by Stop
 	stopOnce  sync.Once
 	done      chan struct{} // closed when the goroutine has ended
 	err       error         // why the goroutine ended, if not Stop; read only after done closes
 
+	// The reads the core has yet to confirm, by the ID the node gave
+	// each, and the last ID given. Only the goroutine touches them.
+	pending  map[uint64]pendingRead
+	lastRead uint64
+
 	status atomic.Pointer[raft.Status]
+}
+
+// pendingRead is a read the core has yet to confirm: the term in which
+// this node, as leader, took it, and where its answer goes.
+type pendingRead struct {
+	term   raft.Term
+	result chan<- error
 }
 
 // proposal is a command on its way to the core, and where the result goes.
@@ -117,8 +130,10 @@ func Start(cfg Config, st storage.Storage, tr transport.Transport, sm StateMachi
 		logger:       cfg.Logger,
 		inbox:        make(chan raft.Message, inboxSize),
 		proposals:    make(chan proposal),
+		reads:        make(chan chan<- error),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
+		pending:      map[uint64]pendingRead{},
 	}
 	if n.logger == nil {
 		n.logger = slog.Default()
@@ -171,6 +186,33 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) (raft.Index, raft.Term, 
 	}
 }
 
+// ReadIndex returns once the state machine may serve a read that began
+// before the call without going through the log (§8): the core, as
+// leader, has confirmed with a round of heartbeats that it still leads,
+// and the state machine has applied the read's index, so it reflects
+// every write that completed before the call. ReadIndex returns
+// raft.ErrNotLeader on a server that is not the leader, or that stops
+// leading the term before it confirms the read; ErrStopped once the
+// node has stopped; and ctx's error if ctx ends first.
+func (n *Node) ReadIndex(ctx context.Context) error {
+	result := make(chan error, 1)
+	select {
+	case n.reads <- result:
+	case <-n.done:
+		return ErrStopped
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-n.done:
+		return ErrStopped
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Status returns the core's role, term, leader, commitIndex, and
 // lastApplied as of the last input the node handled.
 func (n *Node) Status() raft.Status { return *n.status.Load() }
@@ -218,6 +260,8 @@ func (n *Node) run() {
 			n.err = n.handleReady()
 		case p := <-n.proposals:
 			n.err = n.propose(p)
+		case r := <-n.reads:
+			n.err = n.readIndex(r)
 		}
 		n.publish()
 	}
@@ -241,6 +285,18 @@ func (n *Node) propose(p proposal) error {
 	return nil
 }
 
+// readIndex asks the core to confirm a read, and keeps where its answer
+// goes until the core does.
+func (n *Node) readIndex(result chan<- error) error {
+	n.lastRead++
+	if err := n.core.ReadIndex(n.lastRead); err != nil {
+		result <- err
+		return nil
+	}
+	n.pending[n.lastRead] = pendingRead{term: n.core.Status().Term, result: result}
+	return n.handleReady()
+}
+
 // handleReady carries out the core's Ready in the order ADR-0001 requires.
 // Saving comes first: a vote or an acknowledgment must not leave before
 // the state it reflects is durable, nor an entry be applied before it is
@@ -256,7 +312,23 @@ func (n *Node) handleReady() error {
 	if err := n.apply(rd); err != nil {
 		return err
 	}
+	n.answerReads(rd.ReadStates)
 	return n.maybeCompact()
+}
+
+// answerReads answers the reads the core confirmed. Their Ready's
+// committed entries, now applied, reach every read's index.
+func (n *Node) answerReads(confirmed []raft.ReadState) {
+	for _, rs := range confirmed {
+		if rs.Index > n.applied {
+			panic(fmt.Sprintf("node: the core confirmed a read at index %d with %d applied, but a Ready's committed entries reach its reads' indexes",
+				rs.Index, n.applied))
+		}
+		if p, ok := n.pending[rs.ID]; ok {
+			delete(n.pending, rs.ID)
+			p.result <- nil
+		}
+	}
 }
 
 // apply restores the state machine from rd's snapshot when that is past
@@ -299,11 +371,19 @@ func (n *Node) maybeCompact() error {
 }
 
 // publish makes the core's status visible to Status, and logs a change of
-// role, term, or leader.
+// role, term, or leader. The core drops the reads it held once it stops
+// leading, so their callers learn that it no longer leads.
 func (n *Node) publish() {
 	st := n.core.Status()
 	was := n.status.Swap(&st)
-	if st.Role != was.Role || st.Term != was.Term || st.Leader != was.Leader {
-		n.logger.Info("node: role, term, or leader changed", "leader", st.Leader)
+	if st.Role == was.Role && st.Term == was.Term && st.Leader == was.Leader {
+		return
+	}
+	n.logger.Info("node: role, term, or leader changed", "leader", st.Leader)
+	for id, p := range n.pending {
+		if st.Role != raft.Leader || st.Term != p.term {
+			delete(n.pending, id)
+			p.result <- raft.ErrNotLeader
+		}
 	}
 }
