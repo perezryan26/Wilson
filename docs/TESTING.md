@@ -1,6 +1,6 @@
 # Testing
 
-Six independent harnesses produce the evidence for Wilson's correctness, and no single one is trusted alone. This file says what each one catches, how to run it, and how to read its output. Harnesses that are not built yet are marked as such.
+Six independent harnesses produce the evidence for Wilson's correctness, and no single one is trusted alone. This file says what each one catches, how to run it, and how to read its output.
 
 ## Everyday checks
 
@@ -10,12 +10,12 @@ Six independent harnesses produce the evidence for Wilson's correctness, and no 
 | --- | --- | --- | --- |
 | Race detector (`-race`) | Data races in the runtime, transport, kvserver, and client | Every test run | Runs every test, among them the runtime's, the transport's, the key-value server's, and the client's, and three `kvnode` processes built with it |
 | Deterministic simulator | Safety violations under drops, delays, reordering, duplication, partitions, crashes, and tick skew | 1,000 seeds per push; 20,000 before each phase tag; 50,000 nightly | Checks the five Figure 3 properties, terms, votes, applied order, and every snapshot after every event, with crashes in the middle of disk writes and compaction as often as every entry, and liveness after faults heal; five clients of the key-value service make requests throughout |
-| MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | By hand, through the private adapter; a lab counts as passed after 20 consecutive passing runs with `-race` | Lab 3 (3A–3D) passes 20 runs in a row, no test over 60 s and no run over 402 s; Lab 4 waits for its adapter |
-| Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Checks the clients' history of every simulator seed, with reads through the log in half the seeds and through ReadIndex in the other half |
+| MIT 6.5840 Labs 3 and 4 | Bugs found by an independent test suite; timing and RPC-count limits | By hand, through the private adapter; a lab counts as passed after 20 consecutive passing runs with `-race` | Lab 3 (3A–3D) passes 20 runs in a row, no test over 58 s and no run over 412 s; so does Lab 4 (4A–4C), no test over 31 s and no run over 279 s |
+| Porcupine | Client histories that are not linearizable | Every KV simulator seed; chaos runs; MIT Lab 4 | Checks the clients' history of every simulator seed, with reads through the log in half the seeds and through ReadIndex in the other half, and of every chaos run, before and after a full restart; Lab 4's tests check theirs with the course's own copy |
 | Fuzzing and disk faults | Decoder panics, torn writes, lost fsyncs, corrupted files | 60 s per target per push; 10 min per target nightly and before each phase tag; crash tests on every test run | Fuzzes the WAL record, snapshot file, Raft message, key-value command, and key-value snapshot decoders; crash tests at every write boundary of the storage, snapshot saves included |
-| Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Nightly | Not built |
+| Chaos test | Bugs only real processes, sockets, `kill -9`, and disks expose | Nightly, for 30 minutes; `make chaos DURATION=D` by hand | Passes 30 minutes of SIGKILLs, restarts, and partitions under five clients: 1,638 faults and 170,380 operations, with no violation and no lost acknowledged write |
 
-A nightly workflow ([nightly.yml](../.github/workflows/nightly.yml)) runs `make sim SEEDS=50000` and `make fuzz FUZZTIME=10m`. GitHub runs it on the default branch, and it can be started by hand from the Actions tab.
+A nightly workflow ([nightly.yml](../.github/workflows/nightly.yml)) runs `make sim SEEDS=50000` and `make fuzz FUZZTIME=10m`, and beside them, in a job of its own, `make chaos DURATION=30m`. GitHub runs it on the default branch, and it can be started by hand from the Actions tab.
 
 ## Unit tests and the election harness
 
@@ -52,7 +52,7 @@ go test -race -count=50 -run TestIntegration ./...
 
 ## Race detector
 
-`make test` runs every package with `-race`, locally and in CI. The Raft core is single-threaded by design, so races can only live in the runtime, transport, kvserver, and client. Their tests exercise concurrency on purpose: parallel proposals and reads, a stop while messages and proposals are in flight, a leader stopped mid-run, and one client used from many goroutines. The integration test builds the server itself with the race detector.
+`make test` runs every package with `-race`, locally and in CI. The Raft core is single-threaded by design, so races can only live in the runtime, transport, kvserver, and client. Their tests exercise concurrency on purpose: parallel proposals and reads, a stop while messages and proposals are in flight, a leader stopped mid-run, and one client used from many goroutines. The integration and chaos tests build the server itself with the race detector and fail if a server reports a race.
 
 ## Deterministic simulator
 
@@ -176,32 +176,43 @@ This reruns seed N alone and logs its trace with every message added. A delivery
 
 ## MIT 6.5840 test suites
 
-MIT's 6.5840 course publishes test suites for Raft (Lab 3, parts 3A–3D) and for a key-value service on top of it (Lab 4, parts 4A–4C). Running them against this code gives evidence from tests written by someone else, with limits of their own: at most ten heartbeats a second, a new leader within five seconds of a failure, few RPCs per agreement and few bytes per command, a small persisted state once snapshots begin, at most 120 seconds for any test, and at most 600 seconds for a whole lab. Lab 3 runs today, and again after every change to the core; Lab 4 needs an adapter of its own, which is not written yet.
+MIT's 6.5840 course publishes test suites for Raft (Lab 3, parts 3A–3D) and for a key-value service on top of it (Lab 4, parts 4A–4C). Running them against this code gives evidence from tests written by someone else, with limits of their own: at most ten heartbeats a second, a new leader within five seconds of a failure, few RPCs per agreement and few bytes per command, a small persisted state once snapshots begin, at most 120 seconds for any test, and at most 600 seconds for a whole lab. Both run through the adapter below, and both run again after every change to the core.
 
 **Keep the adapter private.** The course asks that solutions not be published, and this repository is public. The adapter that connects the course's API to this code therefore lives in a separate private repository, and no course source is ever committed here or pushed anywhere. The course checkout goes in `.mitlab/`, which git ignores. Never copy course files, or the adapter, into a tracked directory.
 
-**Setup.** You need git, Go, and a checkout of the private adapter. [scripts/mitlab.sh](../scripts/mitlab.sh) clones the course repository into `.mitlab/` once, over `git://`, so the network must let git's port 9418 through. `git://` is not authenticated, so the pinned commit is what vouches for the code: git checks every object it fetches against its hash. On every invocation the script resets the clone to that commit, copies the adapter's `raft1/raft.go` over the course's skeleton, and adds a `replace` directive that points the course module at this checkout. `go get` then raises the course module's `go` line to this module's, as Go requires of a module that depends on a newer one, and its Porcupine to this module's version; the raised line turns on a vet check that the course's own test files fail, so the tests run with `-vet=off`. Each part runs with `-race`:
+**Setup.** You need git, Go, and a checkout of the private adapter. [scripts/mitlab.sh](../scripts/mitlab.sh) clones the course repository into `.mitlab/` once, over `git://`, so the network must let git's port 9418 through. `git://` is not authenticated, so the pinned commit is what vouches for the code: git checks every object it fetches against its hash. On every invocation the script resets the clone to that commit, copies the adapter's files over the course's skeletons (`raft1/raft.go` for Lab 3; `kvraft1/server.go`, `kvraft1/client.go`, and `kvraft1/rsm/rsm.go` for Lab 4), and adds a `replace` directive that points the course module at this checkout. `go get` then raises the course module's `go` line to this module's, as Go requires of a module that depends on a newer one, and its Porcupine to this module's v1.3.1. A second `replace` pins Porcupine back to the course's own v1.0.3, so Lab 4's linearizability checks run as the course ships them; the adapter imports only `raft`, which needs none. The raised `go` line turns on a vet check that the course's own test files fail, so the tests run with `-vet=off`. Lab 4's parts live in two packages: 4A in `kvraft1/rsm`, 4B in `kvraft1`, and 4C in both, since `TestSnapshot4C` tests the rsm; the script runs the packages one after the other. Each part runs with `-race`:
 
 ```sh
-MITLAB_ADAPTER=../wilson-mitlab make mitlab PART=3B           # one part: 3A, 3B, 3C, or 3D
-MITLAB_ADAPTER=../wilson-mitlab make mitlab RUNS=20           # all of Lab 3, twenty times
-MITLAB_ADAPTER=../wilson-mitlab scripts/mitlab.sh -n 20 -p 4  # the same, four runs at a time
+MITLAB_ADAPTER=../wilson-mitlab make mitlab PART=3B             # one part: 3A to 3D, or 4A to 4C
+MITLAB_ADAPTER=../wilson-mitlab make mitlab RUNS=20             # all of Lab 3, twenty times
+MITLAB_ADAPTER=../wilson-mitlab make mitlab PART=4 RUNS=20      # all of Lab 4, twenty times
+MITLAB_ADAPTER=../wilson-mitlab scripts/mitlab.sh -n 20 -p 4 4  # all of Lab 4, four runs at a time
 ```
 
-**The adapter.** In the course's tests each Raft peer runs in a process of its own, and the test process relays every RPC through a simulated network that delays, drops, reorders, and partitions. The adapter is the runtime for one core in such a process, playing the part `node/` plays in `kvnode`. It configures the core with `raft.MITLabConfig()`, which leaves the election no-op off because the tests check which command sits at each index, ticks it every 10 ms, and maps `Start`, `GetState`, and `Snapshot` onto `Propose`, `Status`, and `Compact`. After every call into the core it handles the `Ready` in the contract's order: it saves the hard state, the snapshot's index and term, and the log after it, together with the snapshot, in one call to the course's persister; then it sends the messages; then it queues the committed entries, and any snapshot from the leader, for a goroutine that delivers them to the tests in order. Each Raft RPC is a single call of the course's RPC library, with the core's response as its reply, because the tests count calls and a response sent as a message of its own would double them. Every peer process is built with the race detector, and the script fails a run whose output reports a data race, even if every test passed.
+**The adapter.** In the course's tests each Raft peer runs in a process of its own, and the test process relays every RPC through a simulated network that delays, drops, reorders, and partitions. The adapter is the runtime for one core in such a process, playing the part `node/` plays in `kvnode`. It configures the core with `raft.MITLabConfig()`, which leaves the election no-op off because the tests check which command sits at each index, ticks it every 10 ms, and maps `Start`, `GetState`, and `Snapshot` onto `Propose`, `Status`, and `Compact`. After every call into the core it handles the `Ready` in the contract's order: it saves the hard state, the snapshot's index and term, and the log after it, together with the snapshot, in one call to the course's persister; then it sends the messages; then it queues the committed entries, and any snapshot from the leader, for a goroutine that delivers them to the tests in order. Each Raft RPC is a single call of the course's RPC library, with the core's response as its reply, because the tests count calls and a response sent as a message of its own would double them. Every server process is built with the race detector, and the script fails a run whose output reports a data race, even if every test passed.
+
+For Lab 4 the adapter adds the three pieces the course leaves to its students. The rsm proposes each operation through `Start`, tagged with a random 64-bit ID, and waits until its one reader goroutine applies it, or until its server leaves the term it proposed in, when it answers that the server is not the leader; the ID tells an operation from another one a new leader put at the same index, which a counter could not after a restart. The reader applies operations in log order, restores the leader's snapshots, and snapshots once the persisted state reaches the tests' limit. Its core runs with the election no-op on, as `kvnode`'s does, since Lab 4's tests never look at log indexes; the course's `applyCh` carries no entry types, so no-ops never reach it. On top of the rsm, the course's key-value server keeps a value and a version for each key and applies a Put only when its version matches, which makes a retried Put safe without client sessions, and its clerk finds the leader and retries, reporting a Put whose retry finds its version taken as maybe applied. Those versioned semantics stay inside the adapter; this project's own key-value API does not change.
 
 **The repeat runner.** With `-n N`, the script runs the part N times, `-p` at a time, logs each run under `.mitlab/logs/`, and prints how many runs each test passed, each test's longest time, and the slowest run. It exits non-zero if any run failed.
 
-**Results.** Against the course's tests at the pinned commit (February 2026), all of Lab 3 passes twenty runs in a row with `-race`, four at a time on a 10-core Mac: 560 test runs, with no failure and no data race. The slowest test took 59.0 s (`TestSnapshotInstallUnreliable3D`), against the course's limit of 120 s, and a whole run took 377 to 402 s, a mean of 392 s, against its 600 s. These runs include the election no-op and ReadIndex; `MITLabConfig` leaves the no-op off, and the tests make no reads, so their AppendEntries carry read round 0. Before those changes, the same twenty runs took 381 to 405 s.
+**Results.** Against the course's tests at the pinned commit (February 2026), all of Lab 3 passes twenty runs in a row with `-race`, four at a time on a 10-core Mac: 560 test runs, with no failure and no data race. The slowest test took 57.2 s (`TestSnapshotInstallUnreliable3D`), against the course's limit of 120 s, and a whole run took 383 to 411 s, a mean of 395 s, against its 600 s. These runs include the adapter's changes for Lab 4, which leave Lab 3's configuration as it was: `MITLabConfig` leaves the no-op off, and the tests make no reads, so their AppendEntries carry read round 0. Before the election no-op and ReadIndex existed, the same twenty runs took 381 to 405 s.
 
 | Part | Tests | Mean time | Slowest |
 | --- | --- | --- | --- |
-| 3A, elections | 3 | 15.4 s | 16.3 s |
-| 3B, agreement | 10 | 48.6 s | 51.4 s |
-| 3C, persistence | 8 | 138.7 s | 146.3 s |
-| 3D, snapshots | 7 | 187.9 s | 194.6 s |
+| 3A, elections | 3 | 15.4 s | 16.4 s |
+| 3B, agreement | 10 | 49.3 s | 52.2 s |
+| 3C, persistence | 8 | 141.0 s | 146.9 s |
+| 3D, snapshots | 7 | 187.6 s | 197.8 s |
 
-The first run, before the election no-op and ReadIndex existed, found one failure. `TestCount3B` counted 46 RPCs to agree on twelve commands, where it allows 42: the leader sent each follower its unacknowledged entries again on every proposal, and again on every reply that left the follower behind. `TestProposalBurstSendsFewAppendEntries` reproduces it in the simulator, and the leader now sends a new entry at once only to followers owed nothing earlier ([ARCHITECTURE.md](ARCHITECTURE.md#log-replication)). Lab 4 will be held to the same twenty runs.
+The first run, before the election no-op and ReadIndex existed, found one failure. `TestCount3B` counted 46 RPCs to agree on twelve commands, where it allows 42: the leader sent each follower its unacknowledged entries again on every proposal, and again on every reply that left the follower behind. `TestProposalBurstSendsFewAppendEntries` reproduces it in the simulator, and the leader now sends a new entry at once only to followers owed nothing earlier ([ARCHITECTURE.md](ARCHITECTURE.md#log-replication)).
+
+All of Lab 4 passes twenty runs in a row with `-race`, four at a time on the same Mac: 580 test runs, with no failure, no data race, and no labgob warning, and it passed every test from its first run. The slowest test took 30.6 s (`TestPersistPartitionUnreliableLinearizable4B`), and a whole run took 261 to 279 s, a mean of 269 s, against the course's 600 s.
+
+| Part | Tests | Mean time | Slowest |
+| --- | --- | --- | --- |
+| 4A, the rsm | 7 | 56.2 s | 57.6 s |
+| 4B, the key-value service | 13 | 126.3 s | 140.0 s |
+| 4C, snapshots | 9 | 83.6 s | 93.3 s |
 
 A failure found here is handled like any other heavyweight-harness failure: a scripted simulator test reproduces it first, then the core is fixed. The adapter changes only when the adapter itself is wrong.
 
@@ -214,7 +225,7 @@ A failure found here is handled like any other heavyweight-harness failure: a sc
 - **Unknown outcomes.** An operation whose outcome its client never learned, because its answer never came or its session expired, stays open to the end of the history, and the model accepts any answer for it: it may have taken effect at any time after its call, or never.
 - **Failures.** An illegal history fails the run, and Porcupine's HTML visualization of it is written to a file in the system's temporary directory, which the error names. A check that does not finish within its timeout is reported as a warning, not a pass.
 
-Every seed of the randomized schedule checks its history, and 20,000 seeds pass: 10,000 reading through ReadIndex and 10,000 through the log, each half with the no-op on and half with it off. The probes [above](#the-randomized-schedule) show what the check catches: stale reads from a leader that skipped its heartbeat round or its term's first commit, and retried writes run twice. The chaos test and the MIT Lab 4 adapter will check theirs.
+Every seed of the randomized schedule checks its history, and 20,000 seeds pass: 10,000 reading through ReadIndex and 10,000 through the log, each half with the no-op on and half with it off. The probes [above](#the-randomized-schedule) show what the check catches: stale reads from a leader that skipped its heartbeat round or its term's first commit, and retried writes run twice. The [chaos test](#chaos-test) checks its clients' history twice, before and after a full restart, and MIT's Lab 4 tests check theirs with the course's own copy of Porcupine.
 
 ## Fuzzing and disk fault injection
 
@@ -235,7 +246,25 @@ File storage reaches the disk only through a small file-system interface ([ARCHI
 
 ## Chaos test
 
-Not built yet. It will start five real `kvnode` processes behind test-controlled TCP proxies, kill and restart them with `kill -9`, partition links, and run concurrent clients through the client library. It then checks the history with Porcupine, restarts the whole cluster, and verifies every acknowledged write.
+`TestChaos` in [`test/chaos`](../test/chaos) runs the system as it runs in production, five `kvnode` processes on localhost with their logs on disk, and does to it what the simulator cannot: it kills processes with SIGKILL and cuts real TCP connections.
+
+- **Proxies.** A TCP proxy sits on each of the 20 directed links between servers. Server i's `-peers` names proxy i→j as server j's address, so every message from i to j crosses that proxy, and the servers carry no test hooks. A cut proxy closes the connections it carries and holds new ones without forwarding a byte, as a partitioned network would, so senders time out rather than see a refused connection; healing it releases them. Clients reach each server at its own address. A leader hint names the address the hinting server sends to, which is a proxy, so a client that follows one may cross a link the test has cut; it then retries elsewhere or gives up. `TestProxyCutsAndHeals` checks the proxy on every `make test`.
+- **Servers.** They are built with the race detector. Odd-numbered servers serve reads through ReadIndex and even-numbered ones through the log, and server i compacts its log every 10·2^(i−1) entries, from 10 to 160, so both read paths and InstallSnapshot run under every fault.
+- **Faults.** Every 0.2 to 2 s the test picks one: kill a server with SIGKILL, the leader half the time, while at most two are down; restart one from its disk; partition one or two servers from the rest, both ways; cut one directed link; or heal every link. A server that exits on its own, by a panic or a refusal to recover, fails the test. The schedule goes to `faults.log`.
+- **Clients.** Five clients, each with its own session, run Gets (half of their operations), Puts, and Deletes back to back through the client library, each giving up after a random 0.2 to 5 s. A write given up on stays open in the history, since it may yet take effect; a Get given up on returns with any value, since it changed nothing. Keys change every five seconds, three at a time, so each key's history, and so each of Porcupine's partitions, stays short.
+- **Checks.** When the faults stop, every link heals, every server restarts, and Porcupine checks the history. Then every server is killed at once and restarted from its disk, and a sixth client reads every key back. The history with those reads must still be linearizable, so an acknowledged write that the restart lost, or one that came back after being overwritten, fails the test. Last, every server must shut down cleanly on SIGTERM, and no server's output, in any of its lives, may report a data race.
+
+```sh
+make chaos DURATION=30m
+```
+
+Without `-duration` the test is skipped, so `make test` leaves it out. `make chaos` turns off `go test`'s timeout, whose panic would skip the cleanup that kills the servers; every wait has a bound of its own instead. A failed run keeps the servers' logs, the fault schedule, and any visualization in a temporary directory, which the failure names.
+
+**Results.** A 30-minute run on a 10-core Mac injected 1,638 faults, 263 kills, 261 restarts, 391 partitions, 355 single-link cuts, and 368 heals, through 2,146 terms. Its five clients ran 170,380 operations on 1,083 keys: 84,402 Gets answered and 514 given up, and 84,895 writes acknowledged and 569 of unknown outcome. Both histories were linearizable, each checked in under 0.3 s; all 1,083 keys read back after the full restart; and every server shut down cleanly, with no race reported.
+
+**What it catches.** Three deliberate bugs, each given three minutes, fail it at its first check: reads confirmed without a heartbeat round, retried writes applied a second time, and Puts acknowledged as soon as they are proposed rather than once they apply.
+
+The test cannot see a missing fsync: SIGKILL leaves the operating system's page cache intact, so everything a server wrote before it died survives. The storage's [crash tests](#fuzzing-and-disk-fault-injection) cover that, with a file system that loses unsynced writes.
 
 ## Static analysis
 

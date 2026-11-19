@@ -18,7 +18,7 @@ MIT 6.5840's Lab 3 tests, which this core must also pass, check which command si
 
 - `raft.EntryType` says what an entry holds: `EntryNormal` (0), a command for the state machine, or `EntryNoOp` (1), nothing. `Entry` gains a `Type` field. The WAL keeps it in the entry record's type byte, which [ADR-0003](0003-wal-format.md) reserved for it; recovery refuses any other value.
 - `Config.CommitNoOpOnElection` turns the no-op on. `becomeLeader` resets `nextIndex` and `matchIndex` as before, then appends an entry of type `EntryNoOp` and of the new term after its last entry, so the first heartbeat carries it. In a one-server cluster it commits at once.
-- `DefaultConfig` turns it on, and `kvnode` runs with it. `MITLabConfig` leaves it off.
+- `DefaultConfig` turns it on, and `kvnode` runs with it. `MITLabConfig` leaves it off; the MIT adapter turns it on for Lab 4, whose tests never look at log indexes, and keeps no-ops off the course's `applyCh`, whose messages carry no entry type.
 - A no-op travels like any entry: persisted through `Ready`, replicated, committed, and released in `CommittedEntries`. State machines skip it: the key-value service's `StateMachine` hands only `EntryNormal` entries to its store.
 
 ## Alternatives considered

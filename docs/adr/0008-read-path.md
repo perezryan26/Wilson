@@ -51,4 +51,4 @@ A Get is a command, `kv.OpGet` with no session, which the server proposes and an
 - A leader cut off in a minority never answers a read in either mode: its Get never commits, and no majority confirms its rounds. `TestPartitionedLeaderServesNoStaleRead` checks both in the simulator, and `TestCutOffLeaderServesNoRead` the runtime.
 - With the election no-op off, ReadIndex reads wait until a command of the leader's term commits. `TestNewLeaderServesNoReadBeforeItsTermCommits` shows why that wait matters.
 - Without CheckQuorum (extension E1), a leader cut off in a minority keeps the reads it was asked to confirm until it hears of a later term; their callers time out first.
-- MIT 6.5840's Lab 3 makes no reads, so the adapter's AppendEntries carry round 0.
+- MIT 6.5840's labs make no reads through ReadIndex (Lab 3 makes none, and Lab 4's go through the log), so the adapter's AppendEntries carry round 0.
