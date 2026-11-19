@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-27
+- Amended: 2026-11-15, confirmed reads leave through `Ready`
 
 ## Context
 
@@ -35,13 +36,13 @@ Log compaction, read-index reads, and membership changes add `Compact`, `ReadInd
 - **One goroutine.** The runtime calls the core from a single goroutine; the core is not safe for concurrent use.
 - **Logical time.** Time is counted in ticks. Each election draws its timeout from [T, 2T) ticks (§5.2) using an injected, seeded `*rand.Rand`.
 - **No hidden nondeterminism.** No output depends on map iteration order; peers live in a sorted slice. The same seed and inputs produce byte-identical outputs.
-- **Every effect leaves through `Ready`.** A `Ready` holds hard state to persist (`currentTerm`, `votedFor`), log entries to append or truncate, messages to send, committed entries to apply, and a snapshot to install. Calling `Ready` returns everything produced since the previous call and clears it.
+- **Every effect leaves through `Ready`.** A `Ready` holds hard state to persist (`currentTerm`, `votedFor`), log entries to append or truncate, messages to send, committed entries to apply, a snapshot to install, and the reads the leader has confirmed ([ADR-0008](0008-read-path.md)). Calling `Ready` returns everything produced since the previous call and clears it.
 
 The runtime handles each `Ready` completely, in this order, before it gives the core another input:
 
 1. Persist hard state and entries, then fsync. A storage error stops the process (fail-stop).
 2. Send messages.
-3. Apply committed entries to the state machine in index order.
+3. Apply committed entries to the state machine in index order, then answer the confirmed reads, whose read index those entries reach.
 
 Step 1 before step 2 enforces Figure 2's rule in one place for every message type: a granted vote or a successful AppendEntries reply never leaves before the state it reflects is durable. Step 1 before step 3 means a server never applies an entry, or answers a client for it, before the entry is on its own disk.
 

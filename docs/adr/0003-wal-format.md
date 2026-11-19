@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-06
+- Amended: 2026-11-15, the entry type of the election no-op
 
 ## Context
 
@@ -34,7 +35,7 @@ Each record is laid out as follows, in little-endian byte order:
 | 3 | truncation | `index u64`: every entry from `index` on is discarded |
 | 4 | snapshot | `currentTerm u64`, `votedFor u64`, `lastIncludedIndex u64`, `lastIncludedTerm u64`: the log starts over from a snapshot ([ADR-0005](0005-snapshot-format.md)) |
 
-Type 0 is invalid. The entry type byte is 0, a normal entry, in every record written today. The election no-op and configuration entries will take other values, so they need no new layout.
+Type 0 is invalid. The entry type byte holds the entry's `raft.EntryType`: 0 for a normal entry, or 1 for the election no-op ([ADR-0006](0006-election-no-op.md)). Recovery refuses any other value. Configuration entries will take another, so they need no new layout.
 
 ### Saving a Ready
 

@@ -10,15 +10,16 @@ func (n *Node) Tick()                                   // advance one logical c
 func (n *Node) Step(m Message)                          // handle an inbound RPC request or response
 func (n *Node) Propose(cmd []byte) (Index, Term, error) // append a command on the leader
 func (n *Node) Compact(index Index, data []byte) error  // replace the log through index with a snapshot
+func (n *Node) ReadIndex(id uint64) error               // confirm leadership before a read that skips the log
 func (n *Node) Ready() Ready                            // effects produced since the last call
 func (n *Node) Status() Status                          // read-only role, term, leader, commitIndex, lastApplied
 ```
 
-After every `Tick`, `Step`, `Propose`, or `Compact`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
+After every `Tick`, `Step`, `Propose`, `Compact`, or `ReadIndex`, the runtime calls `Ready` and handles the result completely, in this order, before it gives the core another input:
 
 1. **Persist.** Save `HardState`, when it is not nil, `Snapshot`, and `Entries` to stable storage, then fsync. A snapshot and the entries saved with it, which are then every entry after it, replace the whole stored log. Otherwise, when `Entries[0].Index` is at or below the last stored index, first discard every stored entry from that index on: the server is overwriting a conflicting suffix. A storage error stops the process, because after a failed fsync the state on disk is unknown.
 2. **Send.** Deliver `Messages`.
-3. **Apply.** If `Snapshot` is past the last entry the state machine applied, restore the state machine from it. Then apply `CommittedEntries` to the state machine, in index order.
+3. **Apply.** If `Snapshot` is past the last entry the state machine applied, restore the state machine from it. Then apply `CommittedEntries` to the state machine, in index order, and answer the reads in `ReadStates`, whose read indexes those entries reach.
 
 | Field | Holds | Step |
 | --- | --- | --- |
@@ -27,6 +28,7 @@ After every `Tick`, `Step`, `Propose`, or `Compact`, the runtime calls `Ready` a
 | `Entries []Entry` | Log entries not yet handed to storage, in index order; with a snapshot, every entry after it | 1 |
 | `Messages []Message` | RPC requests and responses to send | 2 |
 | `CommittedEntries []Entry` | Entries committed since the last `Ready`, in index order, each released once per boot | 3 |
+| `ReadStates []ReadState` | Reads asked about with `ReadIndex` that the leader has since confirmed, each with its read index ([below](#reads)) | 3 |
 
 Persisting before sending is how Figure 2's rule, that persistent state is updated on stable storage before responding to RPCs, holds for every message. The core puts a vote and the reply granting it in the same `Ready`, and new entries and the reply acknowledging them likewise, so no reply leaves before the state it reflects is durable. Were it the other way round, a server that crashed between sending and persisting could restart, forget its vote, and vote again in the same term, and two candidates could win it; or forget entries a leader already counted toward a majority.
 
@@ -36,7 +38,7 @@ A snapshot from the leader is always past everything the state machine applied, 
 
 `Ready` drains: it returns everything produced since the previous call and clears it. There is no acknowledgment call, because the runtime finishes one `Ready` before it calls the core again. `Entries` and `CommittedEntries`, like the entries inside messages, are copies, so nothing the core does later can change them. A snapshot's data is shared, and no one modifies it.
 
-This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, and [ADR-0005](adr/0005-snapshot-format.md) the snapshots.
+This is the contract as the code implements it today. [ADR-0001](adr/0001-deterministic-core.md) describes it in full, [ADR-0005](adr/0005-snapshot-format.md) the snapshots, and [ADR-0008](adr/0008-read-path.md) the reads.
 
 ## Driving the core
 
@@ -56,6 +58,9 @@ for each input, a tick or an inbound message {
 	for _, e := range rd.CommittedEntries {
 		stateMachine.Apply(e)
 	}
+	for _, rs := range rd.ReadStates {
+		answer the read rs.ID from the state machine, which has applied rs.Index
+	}
 	if the log has grown enough since the last snapshot {
 		node.Compact(stateMachine.Applied(), stateMachine.Snapshot())
 		// and handle the Ready that follows, as above
@@ -63,7 +68,7 @@ for each input, a tick or an inbound message {
 }
 ```
 
-Three drivers exist today. The runtime in [`node/`](../node) runs the loop in a real process ([below](#the-runtime)), and two drive it for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). Its servers compact their logs, and its state machine is the list of commands applied.
+Three drivers exist today. The runtime in [`node/`](../node) runs the loop in a real process ([below](#the-runtime)), and two drive it for testing. The three-node harness in [`raft/cluster_test.go`](../raft/cluster_test.go) runs this loop for every server in one goroutine, with [`storage.Memory`](../internal/storage/memory.go) for storage and an in-order message queue for the network. The deterministic simulator in [`internal/sim`](../internal/sim) runs the same loop on a virtual clock, with a network that delays, loses, duplicates, and partitions messages, and saves through the real file storage on a simulated disk that a crash can strike mid-write ([TESTING.md](TESTING.md#deterministic-simulator)). Its servers compact their logs, and run the key-value store as their state machine.
 
 `NewNode` takes what storage held when the server last stopped (`RestoredState`, the zero value for a new server), and the server starts as a follower in that term, with that vote, that snapshot, and the log after it. The runtime restores the state machine from the snapshot first. `commitIndex` and `lastApplied` are volatile, as in Figure 2: a restarted server starts both at the snapshot's last included index, or at 0 with no snapshot, relearns what is committed from the leader, and applies its log again from there.
 
@@ -79,6 +84,7 @@ Once `CompactEvery` entries have been applied past the latest snapshot, the node
 
 - `Step` hands an inbound message to the goroutine through a queue of 1,024 and returns at once. A message that finds the queue full is dropped, as the network might have dropped it.
 - `Propose` hands a command to the goroutine and returns the new entry's index and term once the entry is saved, so a caller never learns of an entry this server could lose in a crash. The entry is not committed yet. A proposal to a follower returns `raft.ErrNotLeader`, and one too large to replicate returns `raft.ErrProposalTooLarge`.
+- `ReadIndex` hands a read to the goroutine, which asks the core to confirm it, and returns once a `Ready` confirms it and its committed entries are applied ([Reads](#reads)). When the node stops leading the term it took the read in, it fails the read with `raft.ErrNotLeader`.
 - `Status` returns the core's status as of the last input. The node logs every change of role, term, or leader, and every snapshot it installs from the leader.
 - `Start` restores the state machine from the latest snapshot before it creates the core, which starts with `lastApplied` at that snapshot's last included index.
 
@@ -93,7 +99,7 @@ The runtime sends through the `Transport` interface in [`internal/transport`](..
 
 ## The server
 
-[`cmd/kvnode`](../cmd/kvnode) runs one server. It creates the data directory if it is missing and fsyncs the directory's parent, opens `FileStorage` there, starts the HTTP transport and the node, and serves the transport's handler on its address. Every log line carries the node's ID, term, and role. SIGINT or SIGTERM stops it in order: the HTTP server stops taking requests and lets those under way finish, then the node stops, then the transport and storage close. Until the key-value service exists, its state machine is the list of commands applied, which `POST /debug/propose` and `GET /debug/state` drive and show.
+[`cmd/kvnode`](../cmd/kvnode) runs one server. It creates the data directory if it is missing and fsyncs the directory's parent, opens `FileStorage` there, and starts the HTTP transport, the node, and the [key-value service](#the-key-value-service) over a `kv.Store`. It serves the transport's handler and the client API on its one address. `-reads` picks how a Get is served: through ReadIndex, the default, or through the log. Every log line carries the node's ID, term, and role. SIGINT or SIGTERM stops it in order: the HTTP server stops taking requests and lets those under way finish, then the node stops, then the transport and storage close.
 
 ## Storage
 
@@ -113,11 +119,11 @@ The WAL is a sequence of records. Every number in one is little-endian.
 | `type` | Record | Payload |
 | --- | --- | --- |
 | 1 | Hard state | `currentTerm u64`, `votedFor u64` (0 for none): 16 bytes |
-| 2 | Entry | `index u64`, `term u64`, an entry type byte (0, a normal entry), then the command, to the end of the record: 17 bytes plus the command |
+| 2 | Entry | `index u64`, `term u64`, the entry type byte (0 for a normal entry, 1 for the election no-op), then the command, to the end of the record: 17 bytes plus the command |
 | 3 | Truncation | `index u64`, the first of the stored entries to discard, all the rest with it: 8 bytes |
 | 4 | Snapshot | `currentTerm u64`, `votedFor u64`, then the snapshot's `lastIncludedIndex u64` and `lastIncludedTerm u64`: 32 bytes. Valid only as the first record of a segment, which it makes the start of the log |
 
-Type 0 and every type above 4 are invalid. So is an entry type byte other than 0, until the election no-op and configuration entries arrive. Here are four records byte by byte, in hex: the hard state of term 3 with a vote for server 2, entry 7 of term 3 with the command `x=1`, a truncation from index 5, and a snapshot record with that hard state for a snapshot through index 7 of term 3. `TestRecordBytes` checks that the encoder produces exactly these.
+Type 0 and every type above 4 are invalid. So is an entry type byte other than 0 or 1. Here are five records byte by byte, in hex: the hard state of term 3 with a vote for server 2, entry 7 of term 3 with the command `x=1`, entry 8, the no-op of term 4, a truncation from index 5, and a snapshot record with that hard state for a snapshot through index 7 of term 3. `TestRecordBytes` checks that the encoder produces exactly these.
 
 ```text
 length       crc32c       type  payload
@@ -126,6 +132,9 @@ length       crc32c       type  payload
 
 15 00 00 00  88 fb 3f 2f  02    07 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00  00      78 3d 31
                                 index 7                  term 3                   normal  "x=1"
+
+12 00 00 00  58 87 ad 0f  02    08 00 00 00 00 00 00 00  04 00 00 00 00 00 00 00  01
+                                index 8                  term 4                   no-op
 
 09 00 00 00  c0 9b 6b ca  03    05 00 00 00 00 00 00 00
                                 index 5
@@ -186,6 +195,7 @@ Steps 1 and 2 each write a temporary file ending in `.tmp`, fsync it, rename it 
 
 The log (`raftLog`) holds a sentinel entry at index 0 of term 0 ahead of the real entries, so the entry before the first always exists. It is the only code that turns a log index into a slice position.
 
+- **Elections.** With `CommitNoOpOnElection`, which `DefaultConfig` sets, a new leader appends an entry of type `EntryNoOp` and of its new term, and its first heartbeat carries it. Once it commits, so does every entry before it (§5.4.2), so the leader knows which entries are committed (§8) without waiting for a client's command ([ADR-0006](adr/0006-election-no-op.md)). `MITLabConfig` leaves it off, because the course's tests check which command sits at each index. The state machine skips no-ops.
 - **Proposals.** `Propose` on the leader appends an entry of the current term and sends it at once to every follower whose next entry it is. A follower still owed earlier entries gets it along with them, from the AppendEntries the reply to the earlier ones sends or from the next heartbeat, so a burst of proposals costs each follower a few messages rather than one or more per proposal. On any other server `Propose` returns `ErrNotLeader`. Every server refuses, with `ErrProposalTooLarge`, a command whose entry alone would exceed `MaxAppendSize`.
 - **Sending.** For each follower the leader keeps `nextIndex` and `matchIndex`, reset after every election. Every AppendEntries carries the entries from the follower's `nextIndex` on, as many as `MaxAppendSize` allows but at least one, so a heartbeat also retries whatever a lost message failed to deliver. Each success sends the next batch at once.
 - **Receiving.** The follower checks the entry at `PrevLogIndex`, keeps the entries it already holds, truncates only at a real conflict, appends the rest, and raises `commitIndex` to `min(LeaderCommit, the request's last entry)`. A stale or repeated request truncates nothing.
@@ -202,6 +212,66 @@ Each server snapshots its own state machine (§7), and a leader sends its snapsh
 - **Receiving.** The follower follows Figure 13. A snapshot at or below `commitIndex` adds nothing, so the follower ignores it and replies that its log already covers it. Otherwise it assembles the chunks in memory, keeps the entries after a matching last included entry (step 6) or discards its log (step 7), and resets its state machine (step 8) by moving `commitIndex` and `lastApplied` to the snapshot's last included index and handing the snapshot to the runtime. InstallSnapshot restarts the election timer, as AppendEntries does.
 - **AppendEntries inside a snapshot.** A request whose `PrevLogIndex` comes before the snapshot's last included entry matches there: the entries the snapshot replaced are committed, so they match every leader's. Only the request's entries after the snapshot reach the log.
 
+## Reads
+
+A read must reflect every write that completed before it began. A Get can go through the log as a command, which orders it with the writes, or skip the log through `ReadIndex` (§8; [ADR-0008](adr/0008-read-path.md)):
+
+- **The round.** `ReadIndex(id)` on the leader starts a round of leadership checks: it increments its read round and sends every other server an AppendEntries, as a heartbeat would, that carries the round in `ReadRound`. A follower echoes the round in every reply in the leader's term, a rejection too, so the leader can tell answers to this round from answers to earlier heartbeats, which messages that arrive late or twice could pass for. On any other server `ReadIndex` returns `ErrNotLeader`.
+- **Confirmation.** A read is confirmed once a majority, the leader included, has answered a round at or past the read's, and the leader has committed an entry of its term, which tells it which entries are committed; the election no-op makes that immediate. `Ready.ReadStates` then releases the read, with the leader's commitIndex as its read index. The same `Ready`'s committed entries bring the state machine to that index, so the runtime answers the read after applying them, and the service reads its state machine.
+- **Leadership lost.** A leader that steps down drops the reads it holds, and the runtime fails them. A leader cut off in a minority never confirms a read, since no majority answers its rounds, though it still believes it leads.
+- **Snapshot transfers.** InstallSnapshot carries no round, so a follower in the middle of a transfer does not count toward confirming reads until the transfer ends.
+
+## The key-value service
+
+The state machine is a key-value store, [`internal/kv`](../internal/kv), which every server applies the same committed commands to. [`internal/kvserver`](../internal/kvserver) serves it to clients over HTTP, and [`client`](../client) and [`cmd/kvctl`](../cmd/kvctl) use that API.
+
+### Commands
+
+A command is a log entry's data, laid out as `[version u8][op u8][request u64][session u64][seq u64][key length u32][key][value]` in little-endian byte order, with the value running to the end. The version is 1. The ops are Register (1), Get (2), Put (3), and Delete (4); 0 is none of them. Every command has every field, and those its op does not use are zero. `request` is a random ID the proposing server picks to recognize the command's result when it applies; the store only copies it into the result. An entry that does not decode as a command changes nothing, on every server alike. Here is a Put of `x=1`, request 7, the second write of session 5, byte by byte; `TestCommandBytes` checks it.
+
+```text
+version  op   request                  session                  seq                      key length   key  value
+01       03   07 00 00 00 00 00 00 00  05 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  01 00 00 00  78   31
+```
+
+### Sessions
+
+Each client registers a session before its first write, and the session's ID is the log index of its Register entry, which no other entry has ([ADR-0007](adr/0007-client-sessions.md)). The client numbers its writes in the session from 1, sends one at a time, and retries a write with the same number. For each session the store keeps the last number applied, that write's response (for a Delete, whether the key existed), and the log index of the session's last command:
+
+- a write from a session the store does not hold is refused with `ErrSessionExpired`, and does not run;
+- one numbered below the session's last is refused with `ErrStaleRequest`;
+- one numbered the same as the last is answered from the record, and does not run again (§8);
+- one numbered above runs, and the record takes its number and response.
+
+A store keeps at most the number of sessions `NewStore` was given; `kvnode` keeps `kv.DefaultMaxSessions`, 10,000. A Register that would exceed it first evicts the session whose last command has the lowest index. Every server applies the same entries, so every server evicts the same session.
+
+### Snapshots of the store
+
+The store's snapshot, the `data` of a [snapshot file](#snapshot-files), is laid out as `[version u8][pair count u32]{[key length u32][key][value length u32][value]}[session count u32]{[id u64][seq u64][last index u64][found u8]}`, with pairs in increasing order of key and sessions of ID, so stores holding the same state encode it identically (§7). The version is 1. Here is a store holding `x=1` and session 5, whose second write, at index 9, deleted a key that existed; `TestStateBytes` checks it.
+
+```text
+version  pairs        key length   key  value length  value  sessions     id                       seq                      last index               found
+01       01 00 00 00  01 00 00 00  78   01 00 00 00   31     01 00 00 00  05 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  09 00 00 00 00 00 00 00  01
+```
+
+### The API
+
+| Request | Answer |
+| --- | --- |
+| `POST /v1/sessions` | 201 `{"session": id}` |
+| `GET /v1/kv/{key}` | 200 with the value as the body, or 404 |
+| `PUT /v1/kv/{key}?session=S&seq=N` with the value as the body | 204 |
+| `DELETE /v1/kv/{key}?session=S&seq=N` | 204 if the key existed, 404 if not |
+| `GET /v1/status` | 200 `{"id", "role", "term", "leader", "leaderAddress", "commitIndex", "lastApplied"}` |
+
+A request waits for its command, under its request ID, before proposing it, because in a cluster of one the command applies before `Propose` returns. Any server answers a request it cannot serve with a status the client acts on, and a JSON body `{"error", "leader"}`:
+
+- **421** when it does not lead, with the leader's address if it knows it. The client goes there.
+- **504** when the request did not finish within two seconds. For a write the outcome is unknown, and the client sends it again with the same number.
+- **410** for an expired session, after which the client registers anew; **409** for a write older than its session's last; **413** for a value too large to replicate; **503** for a stopped node; **400** for a request without a key, or a write without a session and a number from 1.
+
+The client library sends each request to the server it believes leads, follows hints, and tries the next server after a backoff that doubles from 10 ms to at most a second, with jitter. Writes run one at a time per client, and reads in parallel. A write still unanswered when its context ends returns `ErrUnknownOutcome`.
+
 ## Time
 
 The core counts time in ticks and never sees a duration. `DefaultConfig` returns the timing and the tick interval separately: a 10 ms tick, a heartbeat every 5 ticks (50 ms), and election timeouts drawn from [30, 60) ticks ([300 ms, 600 ms)). The runtime ticks the core from a wall-clock ticker, which skips a tick the node is too busy to take rather than queue it. A message between two servers on one network takes about a millisecond, far below the heartbeat interval, as §5.6 requires. `MITLabConfig` is the preset for MIT 6.5840's Lab 3 tests: the same 10 ms tick, a heartbeat every 10 ticks (100 ms, as often as the lab allows), election timeouts drawn from [40, 80) ticks ([400 ms, 800 ms)), each snapshot sent whole, and no cap on the entries an AppendEntries carries. That suits the lab's RPC library, which has no size limit, but not the HTTP transport, so `kvnode` offers only `default`.
@@ -212,7 +282,7 @@ The core counts time in ticks and never sees a duration. `DefaultConfig` returns
 
 ## Messages
 
-A `Message` names its sender and receiver and carries exactly one RPC, as a pointer to a struct named after the paper with Figure 2's or Figure 13's fields: `RequestVoteRequest`, `RequestVoteResponse`, `AppendEntriesRequest`, `AppendEntriesResponse`, `InstallSnapshotRequest`, and `InstallSnapshotResponse`. A response is a message of its own, not a return value, so it can wait in a `Ready` until the state it reflects is durable. Because replies can arrive late, twice, or out of order, the AppendEntries and InstallSnapshot replies add fields that say what they acknowledge ([ADR-0004](adr/0004-fast-log-backtracking.md), [ADR-0005](adr/0005-snapshot-format.md)).
+A `Message` names its sender and receiver and carries exactly one RPC, as a pointer to a struct named after the paper with Figure 2's or Figure 13's fields: `RequestVoteRequest`, `RequestVoteResponse`, `AppendEntriesRequest`, `AppendEntriesResponse`, `InstallSnapshotRequest`, and `InstallSnapshotResponse`. A response is a message of its own, not a return value, so it can wait in a `Ready` until the state it reflects is durable. Because replies can arrive late, twice, or out of order, the AppendEntries and InstallSnapshot replies add fields that say what they acknowledge ([ADR-0004](adr/0004-fast-log-backtracking.md), [ADR-0005](adr/0005-snapshot-format.md)), and AppendEntries and its reply carry the read round ([ADR-0008](adr/0008-read-path.md)).
 
 `Step` applies Figure 2's rule for all servers before any handler runs: a request or response from a later term moves the server to that term as a follower. Each handler can then assume the message's term is at most `currentTerm`.
 
@@ -241,22 +311,28 @@ The same seed and the same inputs produce the same sequence of `Ready` values.
 
 | File | Contents |
 | --- | --- |
-| [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `Entry`, `Snapshot`, `HardState`, `Message` and the RPC structs, `Ready` |
-| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `MITLabConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions |
+| [`types.go`](../raft/types.go) | `Term`, `Index`, `NodeID`, `EntryType`, `Entry`, `Snapshot`, `HardState`, `Message` and the RPC structs, `Ready` |
+| [`node.go`](../raft/node.go) | `Config`, `DefaultConfig`, `MITLabConfig`, `Node`, `NewNode`, `Tick`, `Step`, `Propose`, `Compact`, `Ready`, `Status`, and the three `become*` functions, `becomeLeader` with the election no-op |
 | [`log.go`](../raft/log.go) | The log, `raftLog`: lookups, appends, batches capped by `MaxAppendSize`, the merge that carries out AppendEntries steps 3 and 4, and `restore`, which carries out Figure 13's steps 6 and 7 |
 | [`election.go`](../raft/election.go) | The election timer, `campaign` and its RequestVote retries, the RequestVote receiver, vote counting, and the §5.4.1 up-to-date check |
 | [`append_entries.go`](../raft/append_entries.go) | Sending AppendEntries, the receiver's steps 1–5, following the current leader, the leader's handling of replies, fast backtracking, and the commit rule |
 | [`snapshot.go`](../raft/snapshot.go) | Sending a snapshot in chunks, the InstallSnapshot receiver's steps 1–8, and the leader's handling of replies |
+| [`read.go`](../raft/read.go) | `ReadIndex`, `ReadState`, the rounds of leadership checks, and confirming reads |
 
-## Files in node/, internal/transport/, and cmd/kvnode/
+## Files in node/, internal/transport/, cmd/kvnode/, and the key-value service
 
 | File | Contents |
 | --- | --- |
-| [`node/node.go`](../node/node.go) | `Node`, `Start`, `Config`, `StateMachine`, `ErrStopped`: the goroutine, `Ready` handling, compaction, `Step`, `Propose`, `Status`, and `Stop` |
+| [`node/node.go`](../node/node.go) | `Node`, `Start`, `Config`, `StateMachine`, `ErrStopped`: the goroutine, `Ready` handling, compaction, `Step`, `Propose`, `ReadIndex`, `Status`, and `Stop` |
 | [`internal/transport/transport.go`](../internal/transport/transport.go) | `Transport`, the interface the runtime sends through |
 | [`internal/transport/http.go`](../internal/transport/http.go) | `HTTP`, `NewHTTP`, `HTTPOptions`, `MessagePath`, `MaxMessageSize`: the sender goroutines, the handler, and the message decoder |
 | [`cmd/kvnode/main.go`](../cmd/kvnode/main.go) | Flags, the data directory, startup, graceful shutdown, and the log handler that adds term and role |
-| [`cmd/kvnode/debug.go`](../cmd/kvnode/debug.go) | The state machine that lists commands, and the debug endpoints |
+| [`internal/kv/command.go`](../internal/kv/command.go) | `Command`, `Op`, and the command layout's encoder and decoder |
+| [`internal/kv/store.go`](../internal/kv/store.go) | `Store`: `Apply`, `Get`, sessions and eviction, `Snapshot`, `Restore`, and the snapshot layout's decoder |
+| [`internal/kvserver/statemachine.go`](../internal/kvserver/statemachine.go) | `StateMachine`: the store as a node replicates it, and the requests waiting for their commands |
+| [`internal/kvserver/server.go`](../internal/kvserver/server.go) | `Server`: the HTTP API, leader hints, and timeouts |
+| [`client/client.go`](../client/client.go) | `Client`: leader discovery, retries and backoff, sessions, `ErrUnknownOutcome`, `ErrSessionExpired` |
+| [`cmd/kvctl/main.go`](../cmd/kvctl/main.go) | The command-line client |
 
 ## Files in internal/storage/
 
