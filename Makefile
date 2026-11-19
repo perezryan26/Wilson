@@ -6,7 +6,8 @@ GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v
 SEEDS ?= 1000
 FUZZTIME ?= 60s
 
-# PART picks the MIT 6.5840 Lab 3 part (3 for all); RUNS repeats it.
+# PART picks the MIT 6.5840 part: 3 or 4 for a whole lab, or one of
+# 3A-3D and 4A-4C; RUNS repeats it.
 PART ?= 3
 RUNS ?= 1
 
