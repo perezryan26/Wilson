@@ -11,7 +11,10 @@ FUZZTIME ?= 60s
 PART ?= 3
 RUNS ?= 1
 
-.PHONY: check fmt vet lint test sim fuzz mitlab
+# DURATION is how long make chaos injects faults.
+DURATION ?= 5m
+
+.PHONY: check fmt vet lint test sim fuzz mitlab chaos
 
 # check is everything CI runs on every push.
 check: fmt vet lint test sim fuzz
@@ -38,3 +41,7 @@ fuzz:
 # mitlab needs MITLAB_ADAPTER, the private adapter's checkout (docs/TESTING.md).
 mitlab:
 	./scripts/mitlab.sh -n $(RUNS) $(PART)
+
+# The chaos test bounds its own waits, so go test's timeout is off.
+chaos:
+	go test -race -v -count=1 -timeout 0 -run TestChaos ./test/chaos -duration=$(DURATION)
